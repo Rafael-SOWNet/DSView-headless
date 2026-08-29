@@ -80,15 +80,48 @@ namespace DslCli.Abstractions
         /// <summary>Pre-formatted protocol detail for display, e.g. <c>cmd=0x70 len=3</c>.</summary>
         public string Summary { get; }
 
+        /// <summary>
+        /// The frame exactly as it appeared on the wire, or empty when the decoder does not supply
+        /// it. Deliberately the raw bytes and nothing more: the host has no idea what they mean,
+        /// and only passes them through to writers that need the original octets — currently the
+        /// pcap export. Anything a human should read belongs in <see cref="Summary"/>.
+        /// </summary>
+        public IReadOnlyList<byte> Bytes { get; }
+
         /// <summary>Creates a protocol frame.</summary>
-        public ProtocolFrame(double tStart, double tEnd, FrameKind kind, double maxByteGap, string summary)
+        public ProtocolFrame(double tStart, double tEnd, FrameKind kind, double maxByteGap, string summary,
+                             IReadOnlyList<byte> bytes = null)
         {
             TStart = tStart;
             TEnd = tEnd;
             Kind = kind;
             MaxByteGap = maxByteGap;
             Summary = summary ?? string.Empty;
+            Bytes = bytes ?? EmptyBytes;
         }
+
+        private static readonly byte[] EmptyBytes = new byte[0];
+    }
+
+    /// <summary>
+    /// Implemented alongside <see cref="IProtocolDecoder"/> by a decoder whose frames are worth
+    /// exporting to pcap, for reading in Wireshark.
+    /// </summary>
+    /// <remarks>
+    /// Kept separate from <see cref="IProtocolDecoder"/> so a decoder that only wants to print
+    /// frames does not have to answer a question about link-layer types. The host writes the pcap;
+    /// all it needs from the decoder is which link type to stamp on the file and the frame bytes
+    /// (<see cref="ProtocolFrame.Bytes"/>). It never has to understand the protocol itself, which
+    /// is what lets the dissector live in the decoder's own repository.
+    /// </remarks>
+    public interface IPcapExportable
+    {
+        /// <summary>
+        /// The pcap link type (DLT) to record in the file header. For a bus with no registered
+        /// link type, use one of the user range LINKTYPE_USER0..15 (147..162) and ship a dissector
+        /// that registers against it.
+        /// </summary>
+        int LinkType { get; }
     }
 
     /// <summary>

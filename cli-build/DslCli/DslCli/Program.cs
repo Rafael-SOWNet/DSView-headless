@@ -897,6 +897,62 @@ internal class Program
         }
     }
 
+    // pcap export of decoded frames, so a bus capture can be read in Wireshark with the protocol's
+    // own dissector rather than as a wall of hex.
+    //
+    // NANOSECOND pcap (magic 0xa1b23c4d), not the classic microsecond one. The timestamps here come
+    // from the sample index, so they are good to one sample period - 10 ns at 100 MHz - and the
+    // classic format would throw away more than half that precision. Reading the timing off the
+    // capture is the entire reason this tool exists, so it is worth the slightly less universal
+    // magic number; Wireshark has understood it since 1.8.
+    //
+    // The host stays protocol-agnostic: it writes whatever bytes the decoder handed back, stamped
+    // with whatever link type the decoder asked for. It never needs to know what a frame means.
+    private static void WritePcap(string path, IReadOnlyList<ProtocolFrame> frames, int linkType, DateTime captureStartUtc)
+    {
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+        using var w = new BinaryWriter(fs);
+
+        const uint MagicNanosecond = 0xa1b23c4d;
+        const uint SnapLen = 262144;
+
+        w.Write(MagicNanosecond);
+        w.Write((ushort)2);          // version major
+        w.Write((ushort)4);          // version minor
+        w.Write(0);                  // thiszone: timestamps are UTC
+        w.Write(0u);                 // sigfigs, always 0 in practice
+        w.Write(SnapLen);
+        w.Write((uint)linkType);
+
+        // Frame times are seconds from the start of the capture; anchor them to the wall clock so
+        // the file reads sensibly next to other captures, while relative times stay exact.
+        long baseTicks = captureStartUtc.Ticks - DateTime.UnixEpoch.Ticks;
+        long baseSeconds = baseTicks / TimeSpan.TicksPerSecond;
+        long baseNanos = (baseTicks % TimeSpan.TicksPerSecond) * 100;   // 1 tick = 100 ns
+
+        foreach (var f in frames)
+        {
+            if (f.Bytes.Count == 0) continue;
+
+            // Split before converting to avoid losing sample-level precision in a double that
+            // already carries the whole wall-clock offset.
+            long secs = (long)Math.Floor(f.TStart);
+            long nanos = (long)Math.Round((f.TStart - secs) * 1_000_000_000.0);
+            if (nanos >= 1_000_000_000) { nanos -= 1_000_000_000; secs++; }
+
+            long ts = baseSeconds + secs;
+            long tn = baseNanos + nanos;
+            if (tn >= 1_000_000_000) { tn -= 1_000_000_000; ts++; }
+
+            var bytes = f.Bytes as byte[] ?? System.Linq.Enumerable.ToArray(f.Bytes);
+            w.Write((uint)ts);
+            w.Write((uint)tn);
+            w.Write((uint)bytes.Length);   // captured length
+            w.Write((uint)bytes.Length);   // original length - never truncated
+            w.Write(bytes);
+        }
+    }
+
     /// <summary>One parsed trigger clause: which channel, and the condition character the FPGA wants.</summary>
     private readonly record struct TriggerClause(int Channel, char Condition);
 
@@ -966,6 +1022,7 @@ internal class Program
         string? triggerSpec = null;
         int triggerPos = 0;
         bool wantVcd = false;
+        bool wantPcap = false;
         bool triggerArmed = false;
         var positional = new List<string>();
         for (int i = 0; i < args.Length; i++)
@@ -984,6 +1041,9 @@ internal class Program
                     break;
                 case "--vcd":
                     wantVcd = true;
+                    break;
+                case "--pcap":
+                    wantPcap = true;
                     break;
                 default:
                     positional.Add(args[i]);
@@ -1022,6 +1082,8 @@ internal class Program
             Console.WriteLine("                      capture is free-running, as before.");
             Console.WriteLine("  --trigger-pos PCT   pre-trigger capture position, percent (default 0).");
             Console.WriteLine("  --vcd               also write <base>.vcd, openable in PulseView/GTKWave/DSView.");
+            Console.WriteLine("  --pcap              also write <base>.chN.pcap of the decoded frames, for Wireshark.");
+            Console.WriteLine("                      Needs a protocol decoder plugin that supports pcap export.");
             Console.WriteLine("Writes the interleaved capture, a demuxed <base>.chN.raw per channel,");
             Console.WriteLine("and - when decodeBaud is given - <base>.chN.uart.txt plus, if a protocol decoder");
             Console.WriteLine("plugin is installed, its decoded frames and their timing.");
@@ -1245,6 +1307,7 @@ internal class Program
         }
 
         Console.WriteLine($"Capturing for up to {durationSeconds}s at {sampleRateHz / 1_000_000.0} MHz on channels {string.Join(",", enabledChannels)}...");
+        var captureStartUtc = DateTime.UtcNow;
         var sw = System.Diagnostics.Stopwatch.StartNew();
         while (Native.ds_is_collecting() != 0 && sw.Elapsed.TotalSeconds < durationSeconds + 2)
         {
@@ -1379,6 +1442,29 @@ internal class Program
                         decoder.PrintFrames(bytes, decodeBaud, Console.Out);
                         frames = decoder.Decode(bytes, decodeBaud);
                         AnalyzeTiming($"ch{ch}", frames, bytes, decodeBaud);
+
+                        if (wantPcap)
+                        {
+                            if (decoder is IPcapExportable pcap)
+                            {
+                                int withBytes = 0;
+                                foreach (var f in frames) if (f.Bytes.Count > 0) withBytes++;
+                                if (withBytes == 0)
+                                {
+                                    Console.WriteLine($"  (no pcap: {decoder.Name} returned no frame bytes)");
+                                }
+                                else
+                                {
+                                    string pcapPath = $"{_outBaseName}.ch{ch}.pcap";
+                                    WritePcap(pcapPath, frames, pcap.LinkType, captureStartUtc);
+                                    Console.WriteLine($"  -> {pcapPath} ({withBytes} frame(s), linktype {pcap.LinkType})");
+                                }
+                            }
+                            else
+                            {
+                                Console.WriteLine($"  (no pcap: decoder {decoder.Name} does not support pcap export)");
+                            }
+                        }
                     }
 
                     // Burst view: works even where the signal is too distorted to byte-decode.

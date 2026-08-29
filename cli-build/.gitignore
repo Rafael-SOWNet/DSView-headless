@@ -11,3 +11,7 @@ build.ninja
 *.o
 DslCli/**/bin/
 DslCli/**/obj/
+
+# Python bytecode from the MCP server
+__pycache__/
+*.pyc

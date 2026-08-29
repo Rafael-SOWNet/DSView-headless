@@ -23,6 +23,8 @@ PID at all, and because DSView itself cannot be scripted.
 - **Detect bus idle/busy differentially** when both lines of a pair are captured.
 - **Trigger** on an edge or level per channel, with a pre-trigger position.
 - **Write VCD** so a capture opens in PulseView, GTKWave or DSView itself.
+- **Write pcap** of the decoded frames, for reading in Wireshark with the protocol's own
+  dissector — when the decoder plugin supports it.
 - **Recover a wedged FPGA** without a power cycle (see below).
 
 Timestamps come from the sample index, so they are accurate to one sample period — 10 ns at
@@ -48,6 +50,23 @@ public sealed class MyDecoder : IProtocolDecoder
 }
 ```
 
+To export decoded frames to pcap, also implement `IPcapExportable` and return the raw frame
+octets in `ProtocolFrame.Bytes`:
+
+```csharp
+public sealed class MyDecoder : IProtocolDecoder, IPcapExportable
+{
+    public int LinkType => 147;   // LINKTYPE_USER0..15 = 147..162
+    ...
+}
+```
+
+The host writes the file; it stamps the link type you name and copies the bytes you hand back,
+without needing to understand the protocol. Ship a Wireshark dissector registered against the
+same link type. The pcap is written in **nanosecond** format (magic `0xa1b23c4d`), because the
+timestamps are sample-accurate — 10 ns at 100 MHz — and classic microsecond pcap would throw
+most of that away.
+
 Do **not** ship `DslCli.Abstractions.dll` alongside your plugin — the host provides it, and a
 second copy gives the loader two identical-looking types, at which point the plugin is silently
 ignored. Reference it with `<Private>false</Private>`.
@@ -69,7 +88,7 @@ dotnet build DslCli/DslCli.csproj -c Release # the CLI
 
 ```sh
 DslCli <out.raw> [rate] [secs] [channels] [decodeBaud] [decodeChannels] [vthVolts]
-       [--trigger SPEC] [--trigger-pos PCT] [--vcd]
+       [--trigger SPEC] [--trigger-pos PCT] [--vcd] [--pcap]
 
 DslCli capture.raw 100000000 1.0 0,3 115200 0,3
 DslCli capture.raw 100000000 1.0 0,3 0 0 0 --trigger ch0=F --trigger-pos 20 --vcd
@@ -77,7 +96,7 @@ DslCli capture.raw 100000000 1.0 0,3 0 0 0 --trigger ch0=F --trigger-pos 20 --vc
 
 Writes `<base>.raw`, `<base>.chN.raw`, and — when `decodeBaud` is given —
 `<base>.chN.uart.txt`, `<base>.chN.bursts.csv`, and `<base>.chN.frames.csv` if a decoder plugin
-is installed. `--vcd` adds `<base>.vcd`.
+is installed. `--vcd` adds `<base>.vcd`; `--pcap` adds `<base>.chN.pcap`.
 
 ### Triggering
 
