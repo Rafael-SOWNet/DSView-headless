@@ -1,0 +1,13 @@
+# Build outputs - only sources belong in the repo
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+build.ninja
+.ninja_deps
+.ninja_log
+*.exe
+*.dll
+*.dll.a
+*.o
+DslCli/**/bin/
+DslCli/**/obj/
