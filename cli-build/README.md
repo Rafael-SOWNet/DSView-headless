@@ -21,6 +21,8 @@ PID at all, and because DSView itself cannot be scripted.
 - **Analyse timing** — burst structure, device turnaround, host turnaround, inter-frame gaps,
   and intra-frame byte gaps, which is where USB/serial scheduling artefacts show up.
 - **Detect bus idle/busy differentially** when both lines of a pair are captured.
+- **Trigger** on an edge or level per channel, with a pre-trigger position.
+- **Write VCD** so a capture opens in PulseView, GTKWave or DSView itself.
 - **Recover a wedged FPGA** without a power cycle (see below).
 
 Timestamps come from the sample index, so they are accurate to one sample period — 10 ns at
@@ -67,12 +69,35 @@ dotnet build DslCli/DslCli.csproj -c Release # the CLI
 
 ```sh
 DslCli <out.raw> [rate] [secs] [channels] [decodeBaud] [decodeChannels] [vthVolts]
+       [--trigger SPEC] [--trigger-pos PCT] [--vcd]
+
 DslCli capture.raw 100000000 1.0 0,3 115200 0,3
+DslCli capture.raw 100000000 1.0 0,3 0 0 0 --trigger ch0=F --trigger-pos 20 --vcd
 ```
 
 Writes `<base>.raw`, `<base>.chN.raw`, and — when `decodeBaud` is given —
 `<base>.chN.uart.txt`, `<base>.chN.bursts.csv`, and `<base>.chN.frames.csv` if a decoder plugin
-is installed.
+is installed. `--vcd` adds `<base>.vcd`.
+
+### Triggering
+
+`--trigger` takes comma-separated `chK=COND` clauses; the `ch` prefix is optional and channels
+you do not mention stay don't-care.
+
+| COND | meaning |
+|---|---|
+| `R` | rising edge |
+| `F` | falling edge |
+| `1` | level high |
+| `0` | level low |
+| `E` | either edge |
+| `X` | don't care |
+
+`--trigger-pos` sets the pre-trigger capture position as a percentage. Without `--trigger` the
+capture is free-running, exactly as before.
+
+A trigger that never fires yields a successful run with zero bytes, which looks identical to
+broken hardware — so the tool says explicitly when that is what happened.
 
 ## FPGA recovery
 
@@ -88,6 +113,14 @@ that led there.
 `mcp/dslogic_mcp.py` exposes `dslogic_capture`, `dslogic_decode`, `dslogic_status` and
 `dslogic_recover`. Paths are resolved relative to the checkout; override with `DSLCLI_PATH`,
 `DSLOGIC_WORK_DIR`, `DSLCLI_PY_DECODER`.
+
+## Credits
+
+The trigger handling and VCD output were ported from the `dsl-capture` CLI in
+[wickerwaka's DSView fork](https://github.com/wickerwaka/DSView) (branch `headless-cli`), GPLv3
+like the rest of this tree. That tool is a separate, Qt-free C implementation with its own
+strengths — a demo-driver mode and a CLI-only CMake build among them — and is worth a look if you
+want capture without the analysis side of this one.
 
 ## Licence
 
