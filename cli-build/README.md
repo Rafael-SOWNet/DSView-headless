@@ -113,7 +113,23 @@ you do not mention stay don't-care.
 | `X` | don't care |
 
 `--trigger-pos` sets the pre-trigger capture position as a percentage. Without `--trigger` the
-capture is free-running, exactly as before.
+capture is free-running, exactly as before — and the tool says so rather than accepting the flag
+and ignoring it. An out-of-range percentage is refused, not clamped.
+
+**The pre-trigger window has a hardware ceiling.** This tool runs the device in STREAM mode, where
+the firmware caps the pre-trigger buffer at **10% of the per-channel depth** (`dsl_fpga_arm` in
+`dsl.c`; BUFFER mode allows 90%). Ask for more and you quietly get less, so the tool computes the
+effective window the same way the firmware does and prints both:
+
+```
+trigger position: 50% of 100000000 samples = 50000000 requested, 13421772 effective
+                  (STREAM ceiling 13421772 = 10% of 134217728 per-channel depth)
+NOTE: the pre-trigger window is capped to 13421772 sample(s) (13.42% of this capture) ...
+```
+
+The ceiling scales with the per-channel depth, so it binds sooner the more channels you enable.
+At typical capture lengths it is nowhere near — a 20 M-sample capture on two channels has a
+53.7 M-sample ceiling — but on long or wide captures it decides your trigger position for you.
 
 A trigger that never fires yields a successful run with zero bytes, which looks identical to
 broken hardware — so the tool says explicitly when that is what happened.

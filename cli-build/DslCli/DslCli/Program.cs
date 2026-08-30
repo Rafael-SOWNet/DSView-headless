@@ -953,6 +953,60 @@ internal class Program
         }
     }
 
+    // What --trigger-pos actually buys you, which is not what you asked for.
+    //
+    // dsl_fpga_arm (dsl.c) turns trigger_pos into a pre-trigger sample count and then clamps it:
+    //
+    //     n = max(pos/100 * limit_samples, DSLOGIC_ATOMIC_SAMPLES)
+    //     n = min(n, channel_depth * (stream ? 10 : DS_MAX_TRIG_PERCENT) / 100)
+    //
+    // This tool forces STREAM mode, so the ceiling is 10% of the per-channel depth - not 90%. Ask
+    // for 50% of a long capture and you quietly get far less, with nothing said. Since the whole
+    // point of a trigger position is knowing where in the buffer your event sits, that silence is
+    // worse than the limit itself, so the numbers are computed here the same way and printed.
+    private static void ReportEffectiveTriggerPosition(int posPercent, ulong limitSamples, int enabledChannelCount)
+    {
+        const uint AtomicSamples = 1u << 6;      // DSLOGIC_ATOMIC_BITS
+        const ulong SamplesAlign = 1023UL;
+        const int StreamMaxPercent = 10;         // the devc->stream branch of the clamp above
+
+        ulong hwDepth = 0;
+        if (Native.ds_get_actived_device_config(IntPtr.Zero, IntPtr.Zero, 30075 /* SR_CONF_HW_DEPTH */,
+                out IntPtr v) == 0 && v != IntPtr.Zero)
+        {
+            hwDepth = Native.g_variant_get_uint64(v);
+        }
+
+        ulong requested = (ulong)(posPercent / 100.0 * limitSamples);
+        ulong withFloor = Math.Max(requested, AtomicSamples);
+
+        if (hwDepth == 0)
+        {
+            Console.WriteLine(string.Format(Inv,
+                "  trigger position: {0}% = {1} pre-trigger sample(s) requested. Could not read " +
+                "HW_DEPTH, so the STREAM-mode ceiling could not be checked.", posPercent, withFloor));
+            return;
+        }
+
+        ulong channelDepth = (hwDepth / (ulong)Math.Max(1, enabledChannelCount)) & ~SamplesAlign;
+        ulong ceiling = channelDepth * StreamMaxPercent / 100;
+        ulong effective = Math.Min(withFloor, ceiling);
+
+        Console.WriteLine(string.Format(Inv,
+            "  trigger position: {0}% of {1} samples = {2} requested, {3} effective " +
+            "(STREAM ceiling {4} = 10% of {5} per-channel depth).",
+            posPercent, limitSamples, withFloor, effective, ceiling, channelDepth));
+
+        if (effective < withFloor)
+        {
+            Console.WriteLine(string.Format(Inv,
+                "  NOTE: the pre-trigger window is capped to {0} sample(s) ({1:F2}% of this capture), " +
+                "well short of the {2}% asked for. That is the hardware's STREAM-mode limit, not a " +
+                "setting - shorten the capture to get a larger fraction before the trigger.",
+                effective, 100.0 * effective / Math.Max(1UL, limitSamples), posPercent));
+        }
+    }
+
     /// <summary>One parsed trigger clause: which channel, and the condition character the FPGA wants.</summary>
     private readonly record struct TriggerClause(int Channel, char Condition);
 
@@ -1023,6 +1077,7 @@ internal class Program
         int triggerPos = 0;
         bool wantVcd = false;
         bool wantPcap = false;
+        bool triggerPosGiven = false;
         bool triggerArmed = false;
         var positional = new List<string>();
         for (int i = 0; i < args.Length; i++)
@@ -1033,11 +1088,15 @@ internal class Program
                     triggerSpec = args[++i];
                     break;
                 case "--trigger-pos" when i + 1 < args.Length:
-                    if (!int.TryParse(args[++i], System.Globalization.NumberStyles.Integer, ic, out triggerPos))
+                    // Refused rather than clamped: silently turning "--trigger-pos 500" into 100 is
+                    // the kind of thing you only notice by not finding your pre-trigger data.
+                    if (!int.TryParse(args[++i], System.Globalization.NumberStyles.Integer, ic, out triggerPos)
+                        || triggerPos < 0 || triggerPos > 100)
                     {
-                        Console.WriteLine("--trigger-pos wants a percent 0-100");
+                        Console.WriteLine($"--trigger-pos wants a percent 0-100, got '{args[i]}'");
                         return;
                     }
+                    triggerPosGiven = true;
                     break;
                 case "--vcd":
                     wantVcd = true;
@@ -1134,6 +1193,14 @@ internal class Program
         // A trigger is programmed on top of that, not instead of it: the enable above is required
         // for the real capture path regardless, and with no clauses every probe stays don't-care,
         // which fires immediately - i.e. free-running, exactly as this tool behaved before.
+        if (triggerSpec is null && triggerPosGiven)
+        {
+            // Without a condition the capture starts immediately, so there is no trigger point for
+            // a position to be relative to. Saying so beats accepting the flag and ignoring it.
+            Console.WriteLine("--trigger-pos has no effect without --trigger: with no condition the " +
+                              "capture is free-running and starts at sample 0.");
+        }
+
         if (triggerSpec is not null)
         {
             if (!TryParseTrigger(triggerSpec, out var clauses, out var terr))
@@ -1296,6 +1363,11 @@ internal class Program
         DumpDiagnosticConfig("immediately before ds_start_collect");
 
         _rawOut = new FileStream(outPath, FileMode.Create, FileAccess.Write);
+
+        // Report the real pre-trigger window now that limit_samples and the channel set are final -
+        // this is the last moment before the FPGA is armed with them.
+        if (triggerArmed)
+            ReportEffectiveTriggerPosition(triggerPos, limitSamples, enabledChannels.Length);
 
         rc = Native.ds_start_collect();
         Console.WriteLine($"ds_start_collect -> {rc}");
