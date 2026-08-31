@@ -310,7 +310,21 @@ internal class Program
 
     // 8-N-1 UART decode with glitch rejection. A start bit must be a genuine falling edge whose
     // low level survives a majority vote at the midpoint; each data bit is likewise majority-voted.
-    private static List<DecodedByte> DecodeUart(byte[] chBytes, double sampleRate, int baud, bool invert = false)
+    // How a character is framed on the wire. Not cosmetic: it sets where the stop bit is, and
+    // getting it wrong makes the stop-bit check land on the parity bit instead.
+    //
+    // Measured on a GeoBUS bus 2026-08-31, three ways agreeing: inter-byte spacing 95.4 us = 11 bit
+    // times exactly at 115200 (11/115200 = 95.49 us); frame durations matching 14 bytes x 11 bits;
+    // and the bit at 9.5 matching EVEN parity of the data byte in 15792 of 15792 characters. That
+    // bus is 8-E-1, and the previously hardcoded 8-N-1 sampled parity and reported it as framing -
+    // 71% "framing errors" on a bus whose every frame CRC-validated.
+    //
+    // Default stays None so existing users of this tool see no change; pass --framing 8E1 for a bus
+    // that carries parity.
+    private enum ParityMode { None, Even, Odd }
+
+    private static List<DecodedByte> DecodeUart(byte[] chBytes, double sampleRate, int baud, bool invert = false,
+                                               ParityMode parity = ParityMode.None)
     {
         if (invert)
         {
@@ -341,10 +355,27 @@ internal class Program
             int val = 0;
             for (int b = 0; b < 8; b++)
                 if (SampleBit(chBytes, s + spb * (1.5 + b), spb)) val |= 1 << b;
-            bool stopOk = SampleBit(chBytes, s + spb * 9.5, spb);
 
-            result.Add(new DecodedByte(s / sampleRate, (byte)val, stopOk));
-            next = s + (long)(spb * 9.5);
+            // With parity the character is 11 bits: parity sits at 9.5 and the stop bit at 10.5.
+            // Without it the stop bit is at 9.5. Sampling the wrong position is the whole bug this
+            // replaces - it does not corrupt the data bits, so the byte values look right while the
+            // framing flag reports something else entirely.
+            bool parityOk = true;
+            double stopPos = 9.5;
+            if (parity != ParityMode.None)
+            {
+                bool parityBit = SampleBit(chBytes, s + spb * 9.5, spb);
+                int ones = System.Numerics.BitOperations.PopCount((uint)val);
+                bool expected = parity == ParityMode.Even ? (ones % 2 == 1) : (ones % 2 == 0);
+                parityOk = parityBit == expected;
+                stopPos = 10.5;
+            }
+            bool stopOk = SampleBit(chBytes, s + spb * stopPos, spb);
+
+            result.Add(new DecodedByte(s / sampleRate, (byte)val, stopOk, parityOk));
+            // Advance past the real end of the character, not past 9.5 - otherwise the scan re-enters
+            // the tail of the character just decoded and leans on the idle guard to recover.
+            next = s + (long)(spb * stopPos);
         }
         return result;
     }
@@ -1210,6 +1241,7 @@ internal class Program
         bool wantPcap = false;
         string? pcapStreamTarget = null;
         int libLogLevel = 3;   // XLOG_LEVEL_INFO
+        var framing = ParityMode.None;   // 8-N-1 unless told otherwise
         bool triggerPosGiven = false;
         double armSeconds = 0;
         bool triggerArmed = false;
@@ -1237,6 +1269,17 @@ internal class Program
                     break;
                 case "--pcap":
                     wantPcap = true;
+                    break;
+                case "--framing" when i + 1 < args.Length:
+                    switch (args[++i].ToUpperInvariant())
+                    {
+                        case "8N1": framing = ParityMode.None; break;
+                        case "8E1": framing = ParityMode.Even; break;
+                        case "8O1": framing = ParityMode.Odd;  break;
+                        default:
+                            Console.Error.WriteLine("--framing takes 8N1, 8E1 or 8O1.");
+                            return;
+                    }
                     break;
                 case "--log-level" when i + 1 < args.Length:
                     if (!int.TryParse(args[++i], out libLogLevel) || libLogLevel < 0 || libLogLevel > 5)
@@ -1295,6 +1338,8 @@ internal class Program
             Console.WriteLine("  --trigger-pos PCT   pre-trigger capture position, percent (default 0).");
             Console.WriteLine("  --vcd               also write <base>.vcd, openable in PulseView/GTKWave/DSView.");
             Console.WriteLine("  --pcap              also write <base>.chN.pcap of the decoded frames, for Wireshark.");
+        Console.WriteLine("  --framing F         8N1 (default), 8E1 or 8O1. With parity the stop bit is at 10.5,");
+        Console.WriteLine("                      not 9.5 - wrong setting makes the framing check read parity.");
         Console.WriteLine("  --log-level N       libsigrok verbosity 0..5, default 3 (info). 5 logs every USB");
         Console.WriteLine("                      transfer and buries the decode output.");
         Console.WriteLine("  --pcap-stream P     stream decoded frames as pcap to a file or named pipe");
@@ -1658,8 +1703,8 @@ internal class Program
                 // exact reverse, at identical timestamps - same signal, opposite polarity).
                 // With no decoder loaded there are no frames to count, so fall back to which
                 // polarity produced fewer framing errors - weaker, but still better than assuming.
-                var bytesNormal = DecodeUart(perCh[idx], sampleRateHz, decodeBaud, invert: false);
-                var bytesInvert = DecodeUart(perCh[idx], sampleRateHz, decodeBaud, invert: true);
+                var bytesNormal = DecodeUart(perCh[idx], sampleRateHz, decodeBaud, invert: false, parity: framing);
+                var bytesInvert = DecodeUart(perCh[idx], sampleRateHz, decodeBaud, invert: true,  parity: framing);
                 int nNormal, nInvert;
                 string unit;
                 if (decoder is not null)
@@ -1678,7 +1723,16 @@ internal class Program
                 var bytes = useInvert ? bytesInvert : bytesNormal;
                 Console.WriteLine($"\n[polarity] ch{ch}: upright={nNormal} {unit}, inverted={nInvert}" +
                                   $" -> using {(useInvert ? "INVERTED" : "upright")}");
-                Console.WriteLine($"[decode] ch{ch} @ {decodeBaud} baud 8-N-1: {bytes.Count} byte(s)");
+                int nFraming = 0, nParity = 0;
+                foreach (var b in bytes) { if (!b.FramingOk) nFraming++; if (!b.ParityOk) nParity++; }
+                string framingName = framing switch
+                {
+                    ParityMode.Even => "8-E-1",
+                    ParityMode.Odd  => "8-O-1",
+                    _               => "8-N-1",
+                };
+                Console.WriteLine($"[decode] ch{ch} @ {decodeBaud} baud {framingName}: {bytes.Count} byte(s), " +
+                                  $"{nFraming} framing error(s), {nParity} parity error(s)");
                 if (bytes.Count > 0)
                 {
                     var sb = new System.Text.StringBuilder();
@@ -1690,8 +1744,8 @@ internal class Program
                     string txt = $"{_outBaseName}.ch{ch}.uart.txt";
                     using (var w = new StreamWriter(txt))
                         foreach (var b in bytes)
-                            w.WriteLine(string.Format(Inv, "{0:F9}\t{1:X2}\t{2}",
-                                b.Time, b.Value, b.FramingOk ? "ok" : "FRAMING"));
+                            w.WriteLine(string.Format(Inv, "{0:F9}	{1:X2}	{2}	{3}",
+                                b.Time, b.Value, b.FramingOk ? "ok" : "FRAMING", b.ParityOk ? "ok" : "PARITY"));
                     Console.WriteLine($"  -> {txt}");
 
                     IReadOnlyList<ProtocolFrame> frames = Array.Empty<ProtocolFrame>();

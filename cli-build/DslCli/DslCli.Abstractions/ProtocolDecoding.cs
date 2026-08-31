@@ -21,14 +21,37 @@ namespace DslCli.Abstractions
         public byte Value { get; }
 
         /// <summary>False when the stop bit was not where it should have been.</summary>
+        /// <remarks>
+        /// Until 2026-08-31 this was sampled at bit position 9.5, which is only the stop bit on a
+        /// frame with NO parity. On an 8-E-1 bus 9.5 is the PARITY bit, so the flag reported the
+        /// parity value rather than framing - 71% "errors" on a bus where every frame's CRC was
+        /// valid, because the parity bit simply tracks the data. It now means what it says, and
+        /// parity is reported separately.
+        /// </remarks>
         public bool FramingOk { get; }
 
-        /// <summary>Creates a decoded byte.</summary>
+        /// <summary>
+        /// False when the parity bit disagreed with the data. Always true when the decode ran with
+        /// no parity configured, since there is no bit to check.
+        /// </summary>
+        public bool ParityOk { get; }
+
+        /// <summary>Creates a decoded byte with no parity bit on the wire.</summary>
         public DecodedByte(double time, byte value, bool framingOk)
+            : this(time, value, framingOk, true)
+        {
+        }
+
+        /// <summary>Creates a decoded byte, including the parity result.</summary>
+        // A second constructor rather than an optional argument on the first: optional arguments are
+        // baked into the call site, so adding one is source-compatible but NOT binary-compatible and
+        // an already-built plugin dies with MissingMethodException. An overload is safe.
+        public DecodedByte(double time, byte value, bool framingOk, bool parityOk)
         {
             Time = time;
             Value = value;
             FramingOk = framingOk;
+            ParityOk = parityOk;
         }
     }
 
