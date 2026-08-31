@@ -200,6 +200,7 @@ internal class Program
     private static readonly object _lock = new();
     private static string _outBaseName = "capture";
     private static bool _loggedFormat;
+    private static PcapSink? _pcapSink;
 
     // Number of enabled channels - needed to demux LA_CROSS_DATA (see CrossDemux).
     private static int _channelCount = 16;
@@ -908,6 +909,136 @@ internal class Program
     //
     // The host stays protocol-agnostic: it writes whatever bytes the decoder handed back, stamped
     // with whatever link type the decoder asked for. It never needs to know what a frame means.
+    // Incremental pcap sink, for feeding Wireshark or tshark live instead of after the fact.
+    //
+    // Deliberately a NAMED PIPE or file, never stdout: this tool is chatty on stdout (polarity,
+    // decode, timing, burst analysis all go to Console.Out), so a pcap on the same stream would be
+    // shredded by its own diagnostics. A pipe keeps the two apart and works with both front ends:
+    //
+    //     DslCli cap.raw 25000000 2 0,2 115200 0,2 2.0 --pcap-stream \\.\pipe\decoded
+    //     tshark -i \\.\pipe\decoded -l          (or Wireshark -i \\.\pipe\decoded -k)
+    //
+    // Start the reader first: opening the server end blocks until a client connects, which is the
+    // behaviour you want - it means no frames are decoded into a pipe nobody is reading.
+    //
+    // The global header is written exactly once, on the first frame, because the link type comes
+    // from the decoder and is not known before then. Each record is flushed as it is written; an
+    // unflushed pcap looks identical to a silent bus, which on this bus is the one confusion worth
+    // spending code to avoid.
+    private sealed class PcapSink : IDisposable
+    {
+        private readonly Stream _s;
+        private readonly BinaryWriter _w;
+        private readonly bool _isPipe;
+        private bool _headerWritten;
+        public int FramesWritten { get; private set; }
+
+        private PcapSink(Stream s, bool isPipe)
+        {
+            _s = s;
+            _w = new BinaryWriter(s);
+            _isPipe = isPipe;
+        }
+
+        // Open the sink BEFORE capturing, not lazily at first export: tshark and Wireshark are
+        // pipe *clients* and fail immediately if the pipe does not exist yet ("error on pipe open:
+        // The system cannot find the file specified. (2)") - they do not retry. The server end must
+        // already be listening. The global header is still written lazily on the first frame, since
+        // the link type comes from the decoder; only the pipe itself is early.
+        public static PcapSink? Open(string target, double waitSeconds)
+        {
+            // \\.\pipe\name -> we are the server. Wireshark/tshark connects as the client.
+            const string prefix = @"\\.\pipe\";
+            if (target.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                string name = target.Substring(prefix.Length);
+                var srv = new System.IO.Pipes.NamedPipeServerStream(
+                    name, System.IO.Pipes.PipeDirection.Out, 1,
+                    System.IO.Pipes.PipeTransmissionMode.Byte,
+                    System.IO.Pipes.PipeOptions.Asynchronous);
+                Console.WriteLine($"[stream] listening on {target} - start the reader now:");
+                Console.WriteLine($"[stream]   tshark -i {target} -l");
+                // Bounded, because an unbounded WaitForConnection() hangs the entire run forever if
+                // the reader never starts or dies at startup, with the process looking busy.
+                var conn = srv.WaitForConnectionAsync();
+                if (!conn.Wait(TimeSpan.FromSeconds(waitSeconds)))
+                {
+                    Console.WriteLine($"[stream] no reader attached within {waitSeconds:F0}s - continuing without streaming.");
+                    try { srv.Dispose(); } catch { }
+                    return null;
+                }
+                Console.WriteLine("[stream] reader attached.");
+                return new PcapSink(srv, isPipe: true);
+            }
+            return new PcapSink(new FileStream(target, FileMode.Create, FileAccess.Write), isPipe: false);
+        }
+
+        public void Write(IReadOnlyList<ProtocolFrame> frames, int linkType, DateTime captureStartUtc)
+        {
+            if (!_headerWritten)
+            {
+                WritePcapGlobalHeader(_w, linkType);
+                _headerWritten = true;
+            }
+            foreach (var f in frames)
+            {
+                if (WritePcapRecord(_w, f, captureStartUtc)) FramesWritten++;
+            }
+            _w.Flush();
+            _s.Flush();
+        }
+
+        public void Dispose()
+        {
+            try { _w.Flush(); _s.Flush(); } catch { }
+            // A broken pipe here just means the reader quit first, which is normal on Ctrl-C.
+            try { _w.Dispose(); } catch { }
+            if (_isPipe) { try { _s.Dispose(); } catch { } }
+        }
+    }
+
+    private const uint PcapMagicNanosecond = 0xa1b23c4d;
+
+    private static void WritePcapGlobalHeader(BinaryWriter w, int linkType)
+    {
+        const uint SnapLen = 262144;
+        w.Write(PcapMagicNanosecond);
+        w.Write((ushort)2);          // version major
+        w.Write((ushort)4);          // version minor
+        w.Write(0);                  // thiszone: timestamps are UTC
+        w.Write(0u);                 // sigfigs, always 0 in practice
+        w.Write(SnapLen);
+        w.Write((uint)linkType);
+    }
+
+    // Returns false for a frame the decoder gave no bytes for - nothing to put on the wire.
+    private static bool WritePcapRecord(BinaryWriter w, ProtocolFrame f, DateTime captureStartUtc)
+    {
+        if (f.Bytes.Count == 0) return false;
+
+        long baseTicks = captureStartUtc.Ticks - DateTime.UnixEpoch.Ticks;
+        long baseSeconds = baseTicks / TimeSpan.TicksPerSecond;
+        long baseNanos = (baseTicks % TimeSpan.TicksPerSecond) * 100;   // 1 tick = 100 ns
+
+        // Split before converting to avoid losing sample-level precision in a double that
+        // already carries the whole wall-clock offset.
+        long secs = (long)Math.Floor(f.TStart);
+        long nanos = (long)Math.Round((f.TStart - secs) * 1_000_000_000.0);
+        if (nanos >= 1_000_000_000) { nanos -= 1_000_000_000; secs++; }
+
+        long ts = baseSeconds + secs;
+        long tn = baseNanos + nanos;
+        if (tn >= 1_000_000_000) { tn -= 1_000_000_000; ts++; }
+
+        var bytes = f.Bytes as byte[] ?? System.Linq.Enumerable.ToArray(f.Bytes);
+        w.Write((uint)ts);
+        w.Write((uint)tn);
+        w.Write((uint)bytes.Length);   // captured length
+        w.Write((uint)bytes.Length);   // original length - never truncated
+        w.Write(bytes);
+        return true;
+    }
+
     private static void WritePcap(string path, IReadOnlyList<ProtocolFrame> frames, int linkType, DateTime captureStartUtc)
     {
         using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
@@ -1077,7 +1208,10 @@ internal class Program
         int triggerPos = 0;
         bool wantVcd = false;
         bool wantPcap = false;
+        string? pcapStreamTarget = null;
+        int libLogLevel = 3;   // XLOG_LEVEL_INFO
         bool triggerPosGiven = false;
+        double armSeconds = 0;
         bool triggerArmed = false;
         var positional = new List<string>();
         for (int i = 0; i < args.Length; i++)
@@ -1103,6 +1237,25 @@ internal class Program
                     break;
                 case "--pcap":
                     wantPcap = true;
+                    break;
+                case "--log-level" when i + 1 < args.Length:
+                    if (!int.TryParse(args[++i], out libLogLevel) || libLogLevel < 0 || libLogLevel > 5)
+                    {
+                        Console.Error.WriteLine("--log-level takes 0..5 (0 none, 1 err, 2 warn, 3 info, 4 dbg, 5 detail).");
+                        return;
+                    }
+                    break;
+                case "--pcap-stream" when i + 1 < args.Length:
+                    pcapStreamTarget = args[++i];
+                    wantPcap = true;          // the stream is a pcap sink; same export path feeds it
+                    break;
+                case "--arm-timeout" when i + 1 < args.Length:
+                    if (!double.TryParse(args[++i], System.Globalization.NumberStyles.Float, ic, out armSeconds)
+                        || armSeconds < 0)
+                    {
+                        Console.WriteLine($"--arm-timeout wants seconds, got '{args[i]}'");
+                        return;
+                    }
                     break;
                 default:
                     positional.Add(args[i]);
@@ -1142,6 +1295,14 @@ internal class Program
             Console.WriteLine("  --trigger-pos PCT   pre-trigger capture position, percent (default 0).");
             Console.WriteLine("  --vcd               also write <base>.vcd, openable in PulseView/GTKWave/DSView.");
             Console.WriteLine("  --pcap              also write <base>.chN.pcap of the decoded frames, for Wireshark.");
+        Console.WriteLine("  --log-level N       libsigrok verbosity 0..5, default 3 (info). 5 logs every USB");
+        Console.WriteLine("                      transfer and buries the decode output.");
+        Console.WriteLine("  --pcap-stream P     stream decoded frames as pcap to a file or named pipe");
+        Console.WriteLine("                      (backslash-backslash-dot-backslash-pipe-backslash-NAME). Start the reader first;");
+        Console.WriteLine("                      until it attaches. NOT stdout - this tool is chatty there.");
+            Console.WriteLine("  --arm-timeout SEC   with --trigger, how long to sit armed waiting for the trigger");
+            Console.WriteLine("                      to fire. Independent of [seconds], which is the capture length,");
+            Console.WriteLine("                      so a long wait costs no extra buffer.");
             Console.WriteLine("                      Needs a protocol decoder plugin that supports pcap export.");
             Console.WriteLine("Writes the interleaved capture, a demuxed <base>.chN.raw per channel,");
             Console.WriteLine("and - when decodeBaud is given - <base>.chN.uart.txt plus, if a protocol decoder");
@@ -1167,7 +1328,14 @@ internal class Program
         Native.ds_set_event_callback(evCb);
         Native.ds_set_datafeed_callback(dfCb);
 
-        Native.ds_log_level(5);
+        // 3 = XLOG_LEVEL_INFO. Was hardcoded to 5 (DETAIL), which logs the USB completion callback
+        // on every transfer - "receive_transfer(): status 0; timeout 0; received 63488 bytes" -
+        // hundreds of lines a second at 25 MHz, burying the decode output and the timing report this
+        // tool exists to produce. Everything load-bearing for diagnosis is sr_info: "Configure FPGA
+        // using", "FPGA configure done", "config_set: setting channel mode to 16", "Set device ext
+        // samplerate". Level 4 adds sr_dbg, 5 adds the per-transfer spew - use --log-level when
+        // debugging the vendor library itself rather than the bus.
+        Native.ds_log_level(libLogLevel);
 
         int rc = Native.ds_lib_init();
         Console.WriteLine($"ds_lib_init -> {rc}");
@@ -1360,6 +1528,11 @@ internal class Program
         }
         Console.WriteLine($"Enabled channels: {string.Join(",", enabledChannels)}");
 
+        // Pipe first, capture second - see PcapSink.Open. 60 s is enough for a human to paste the
+        // tshark line the message above prints.
+        if (pcapStreamTarget is not null)
+            _pcapSink = PcapSink.Open(pcapStreamTarget, 60.0);
+
         DumpDiagnosticConfig("immediately before ds_start_collect");
 
         _rawOut = new FileStream(outPath, FileMode.Create, FileAccess.Write);
@@ -1378,10 +1551,24 @@ internal class Program
             return;
         }
 
-        Console.WriteLine($"Capturing for up to {durationSeconds}s at {sampleRateHz / 1_000_000.0} MHz on channels {string.Join(",", enabledChannels)}...");
+        // Sitting armed is not the same as capturing, and the two need separate budgets.
+        //
+        // The device does not report "armed but not yet triggered", so this cannot distinguish
+        // waiting from capturing - it can only allow enough total time for both. Tying that to
+        // the capture length (the old durationSeconds + 2) meant waiting longer for a trigger
+        // forced a bigger buffer, which is backwards: an armed analyser should be able to wait
+        // all afternoon for a one-off event and still record only the milliseconds around it.
+        double budget = durationSeconds + 2 + (triggerArmed ? armSeconds : 0);
+        if (triggerArmed && armSeconds > 0)
+            Console.WriteLine(string.Format(Inv,
+                "Armed. Waiting up to {0:F0}s for the trigger, then capturing {1}s at {2} MHz on channels {3}...",
+                armSeconds, durationSeconds, sampleRateHz / 1_000_000.0, string.Join(",", enabledChannels)));
+        else
+            Console.WriteLine($"Capturing for up to {durationSeconds}s at {sampleRateHz / 1_000_000.0} MHz on channels {string.Join(",", enabledChannels)}...");
+
         var captureStartUtc = DateTime.UtcNow;
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (Native.ds_is_collecting() != 0 && sw.Elapsed.TotalSeconds < durationSeconds + 2)
+        while (Native.ds_is_collecting() != 0 && sw.Elapsed.TotalSeconds < budget)
         {
             Thread.Sleep(50);
         }
@@ -1525,6 +1712,23 @@ internal class Program
                                 {
                                     Console.WriteLine($"  (no pcap: {decoder.Name} returned no frame bytes)");
                                 }
+                                else if (pcapStreamTarget is not null)
+                                {
+                                    // Opened lazily, and only once: the link type comes from the
+                                    // decoder, and on a pipe the open blocks until a reader
+                                    // attaches - doing that before we know there is anything to
+                                    // send would stall a capture that was never going to emit.
+                                    if (_pcapSink is null)
+                                    {
+                                        Console.WriteLine("  (no stream: no reader ever attached)");
+                                    }
+                                    else
+                                    {
+                                        _pcapSink.Write(frames, pcap.LinkType, captureStartUtc);
+                                        Console.WriteLine($"  -> streamed {withBytes} frame(s) to {pcapStreamTarget}" +
+                                                          $" ({_pcapSink.FramesWritten} total, linktype {pcap.LinkType})");
+                                    }
+                                }
                                 else
                                 {
                                     string pcapPath = $"{_outBaseName}.ch{ch}.pcap";
@@ -1627,6 +1831,15 @@ internal class Program
                     }
                 }
             }
+        }
+
+        // Flush and close the stream sink before releasing the device, so a reader on the other end
+        // of the pipe sees every frame this run decoded rather than losing the tail.
+        if (_pcapSink is not null)
+        {
+            Console.WriteLine($"[stream] closing after {_pcapSink.FramesWritten} frame(s).");
+            _pcapSink.Dispose();
+            _pcapSink = null;
         }
 
         Native.ds_release_actived_device();
