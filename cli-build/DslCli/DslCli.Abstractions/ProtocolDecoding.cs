@@ -47,12 +47,31 @@ namespace DslCli.Abstractions
         // baked into the call site, so adding one is source-compatible but NOT binary-compatible and
         // an already-built plugin dies with MissingMethodException. An overload is safe.
         public DecodedByte(double time, byte value, bool framingOk, bool parityOk)
+            : this(time, value, framingOk, parityOk, 0)
+        {
+        }
+
+        /// <summary>Creates a decoded byte, including the parity result and the rate it was read at.</summary>
+        public DecodedByte(double time, byte value, bool framingOk, bool parityOk, int baud)
         {
             Time = time;
             Value = value;
             FramingOk = framingOk;
             ParityOk = parityOk;
+            Baud = baud;
         }
+
+        /// <summary>
+        /// The bit rate this byte was decoded at, or 0 when the producer did not record it.
+        /// </summary>
+        /// <remarks>
+        /// Not always the rate the capture was started with: a bus can change rate in the middle of
+        /// a capture (GeoBUS SwitchBaudrate, 115200 to 250000 and back), and the host then decodes
+        /// each burst at whichever candidate rate reads it cleanly. A decoder that converts byte
+        /// counts into time (frame end, inter-byte gap) should use this rather than the single rate
+        /// passed to <see cref="IProtocolDecoder.Decode"/> whenever it is non-zero.
+        /// </remarks>
+        public int Baud { get; }
     }
 
     /// <summary>What role a frame plays in a request/response protocol.</summary>

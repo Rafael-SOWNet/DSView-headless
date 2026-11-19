@@ -323,8 +323,11 @@ internal class Program
     // that carries parity.
     private enum ParityMode { None, Even, Odd }
 
+    // [from, to) limits where a start edge may be found (samples; to < 0 = end of capture). The
+    // character itself may run past 'to': the multi-rate decoder cuts segments at idle gaps, and the
+    // last character's stop bit lies after the segment's last edge.
     private static List<DecodedByte> DecodeUart(byte[] chBytes, double sampleRate, int baud, bool invert = false,
-                                               ParityMode parity = ParityMode.None)
+                                               ParityMode parity = ParityMode.None, long from = 1, long to = -1)
     {
         if (invert)
         {
@@ -340,7 +343,8 @@ internal class Program
         // trailing edge of the previous bit looks like a new start bit.
         long guard = Math.Max(1, (long)(spb * 0.25));
 
-        for (long s = 1; s < total; s++)
+        long end = to < 0 ? total : Math.Min(total, to);
+        for (long s = Math.Max(1, from); s < end; s++)
         {
             if (s < next) continue;
             if (!(GetBit(chBytes, s - 1) && !GetBit(chBytes, s))) continue;
@@ -372,12 +376,117 @@ internal class Program
             }
             bool stopOk = SampleBit(chBytes, s + spb * stopPos, spb);
 
-            result.Add(new DecodedByte(s / sampleRate, (byte)val, stopOk, parityOk));
+            result.Add(new DecodedByte(s / sampleRate, (byte)val, stopOk, parityOk, baud));
             // Advance past the real end of the character, not past 9.5 - otherwise the scan re-enters
             // the tail of the character just decoded and leans on the idle guard to recover.
             next = s + (long)(spb * stopPos);
         }
         return result;
+    }
+
+    // One stretch of line activity, decoded at the rate that read it best.
+    private readonly record struct RateSegment(double TStart, double TEnd, int Baud, int Bytes, int Errors);
+
+    // UART decode for a bus that changes rate mid-capture (GeoBUS SwitchBaudrate: 115200 -> 250000,
+    // and back after 200-250 ms of quiet). A single-rate decode reads the other half of the capture
+    // as garbage, so every segment of activity is decoded at each candidate rate and the one with the
+    // fewest framing+parity errors is kept; on a tie the earlier rate in the list wins.
+    //
+    // Segments are cut only where the line has been idle for more than 12 bit times at the SLOWEST
+    // rate. No idle run inside one character can be that long (the start bit is always active), so a
+    // cut always falls between characters - a fixed 50 us cut was tried first and splits a 115200
+    // character such as 0xFE, whose high run is ~9 bit times (78 us). The price is that a request and
+    // its answer usually share one segment, which is harmless: both sides of one exchange always use
+    // the same rate, and the switch itself sits between exchanges, milliseconds apart.
+    //
+    // Active pulses shorter than a quarter bit at the FASTEST rate are ignored when looking for idle
+    // gaps, so ringing on an idle line does not glue two segments at different rates together.
+    private static (List<DecodedByte> Bytes, List<RateSegment> Segments) DecodeUartMultiRate(
+        byte[] chBytes, double sampleRate, int[] bauds, bool invert, ParityMode parity)
+    {
+        if (invert)
+        {
+            var inv = new byte[chBytes.Length];
+            for (int i = 0; i < chBytes.Length; i++) inv[i] = (byte)~chBytes[i];
+            chBytes = inv;
+        }
+
+        long total = (long)chBytes.Length * 8;
+        long gap = (long)(12 * sampleRate / bauds.Min());
+        long minActive = Math.Max(1, (long)(sampleRate / bauds.Max() * 0.25));
+
+        var spans = new List<(long S, long E)>();
+        long segStart = -1, lastEnd = -1;
+        long s = 0;
+        while (s < total)
+        {
+            // Idle is high here (the polarity was normalised above); skip whole idle bytes quickly.
+            if ((s & 7) == 0 && chBytes[s >> 3] == 0xFF) { s += 8; continue; }
+            if (GetBit(chBytes, s)) { s++; continue; }
+            long activeStart = s;
+            while (s < total && !GetBit(chBytes, s)) s++;
+            if (s - activeStart < minActive) continue;      // a spike, not a bit
+            if (segStart < 0) segStart = activeStart;
+            else if (activeStart - lastEnd > gap)
+            {
+                spans.Add((segStart, lastEnd));
+                segStart = activeStart;
+            }
+            lastEnd = s;
+        }
+        if (segStart >= 0) spans.Add((segStart, lastEnd));
+
+        var bytes = new List<DecodedByte>();
+        var segments = new List<RateSegment>(spans.Count);
+        foreach (var (from, to) in spans)
+        {
+            List<DecodedByte>? best = null;
+            int bestBaud = 0, bestErr = int.MaxValue;
+            foreach (int baud in bauds)
+            {
+                var d = DecodeUart(chBytes, sampleRate, baud, invert: false, parity, from, to);
+                int err = d.Count(b => !b.FramingOk || !b.ParityOk);
+                // A rate that found no character at all says nothing; only take it if none did.
+                bool better = best is null
+                    || (best.Count == 0 && d.Count > 0)
+                    || (d.Count > 0 && err < bestErr);
+                if (better) { best = d; bestBaud = baud; bestErr = err; }
+            }
+            bytes.AddRange(best!);
+            segments.Add(new RateSegment(from / sampleRate, to / sampleRate, bestBaud, best!.Count,
+                                         best.Count == 0 ? 0 : bestErr));
+        }
+        return (bytes, segments);
+    }
+
+    private static void ReportRates(string label, List<RateSegment> segments, int[] bauds)
+    {
+        Console.WriteLine($"[rates] {label}: {segments.Count} segment(s) of activity");
+        foreach (int b in bauds)
+        {
+            var at = segments.Where(x => x.Baud == b && x.Bytes > 0).ToList();
+            Console.WriteLine($"  {b,7} baud: {at.Count} segment(s), {at.Sum(x => x.Bytes)} byte(s)");
+        }
+
+        var changes = new List<(double T, int From, int To)>();
+        int prev = 0;
+        foreach (var x in segments.Where(x => x.Bytes > 0))
+        {
+            if (prev != 0 && x.Baud != prev) changes.Add((x.TStart, prev, x.Baud));
+            prev = x.Baud;
+        }
+        Console.WriteLine($"  rate changes: {changes.Count}");
+        foreach (var c in changes.Take(20))
+            Console.WriteLine(string.Format(Inv, "    t={0,12:F6}s  {1} -> {2}", c.T, c.From, c.To));
+
+        // A segment that is clean at no candidate rate is the interesting kind on a switching bus: a
+        // byte sent at the wrong rate, or one cut short by the line driver turning round.
+        var dirty = segments.Where(x => x.Errors > 0).ToList();
+        Console.WriteLine($"  segments clean at no candidate rate: {dirty.Count}");
+        foreach (var x in dirty.Take(15))
+            Console.WriteLine(string.Format(Inv,
+                "    t={0,12:F6}s  {1:F3} ms, best {2} baud: {3} byte(s), {4} error(s)",
+                x.TStart, (x.TEnd - x.TStart) * 1000, x.Baud, x.Bytes, x.Errors));
     }
 
     private static string Lower(FrameKind kind) => kind.ToString().ToLowerInvariant();
@@ -1245,6 +1354,7 @@ internal class Program
         bool triggerPosGiven = false;
         double armSeconds = 0;
         bool triggerArmed = false;
+        bool fromRaw = false;
         var positional = new List<string>();
         for (int i = 0; i < args.Length; i++)
         {
@@ -1300,6 +1410,9 @@ internal class Program
                         return;
                     }
                     break;
+                case "--from-raw":
+                    fromRaw = true;
+                    break;
                 default:
                     positional.Add(args[i]);
                     break;
@@ -1315,9 +1428,18 @@ internal class Program
             ? Array.ConvertAll(args[3].Split(','), int.Parse)
             : new[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
 
-        // args[4] = UART baud to decode (0/omitted = capture only)
+        // args[4] = UART baud to decode (0/omitted = capture only). A comma-separated list
+        //           (115200,250000) decodes each burst at whichever listed rate reads it cleanly,
+        //           for a bus that switches rate mid-capture; the first rate is the primary one.
         // args[5] = comma-separated channels to decode (default: every captured channel)
-        int decodeBaud = args.Length > 4 ? int.Parse(args[4], ic) : 0;
+        int[] decodeBauds = args.Length > 4
+            ? Array.ConvertAll(args[4].Split(','), x => int.Parse(x, ic))
+            : new[] { 0 };
+        if (decodeBauds.Length > 1 && decodeBauds.Any(b => b <= 0))
+        {
+            Console.Error.WriteLine("A list of decode rates must not contain 0.");
+            return;
+        }
         int[] decodeChannels = args.Length > 5
             ? Array.ConvertAll(args[5].Split(','), int.Parse)
             : enabledChannels;
@@ -1349,6 +1471,11 @@ internal class Program
             Console.WriteLine("                      to fire. Independent of [seconds], which is the capture length,");
             Console.WriteLine("                      so a long wait costs no extra buffer.");
             Console.WriteLine("                      Needs a protocol decoder plugin that supports pcap export.");
+            Console.WriteLine("  --from-raw          do not capture: analyse <out.raw> as it is on disk, a capture");
+            Console.WriteLine("                      taken earlier with [channels] enabled, at [sampleRateHz]. A");
+            Console.WriteLine("                      demuxed <base>.chN.raw is a one-channel capture: pass N alone.");
+            Console.WriteLine("  decodeBaud may be a list, e.g. 115200,250000: each burst is decoded at the rate");
+            Console.WriteLine("                      that reads it cleanly (a bus that switches rate mid-capture).");
             Console.WriteLine("Writes the interleaved capture, a demuxed <base>.chN.raw per channel,");
             Console.WriteLine("and - when decodeBaud is given - <base>.chN.uart.txt plus, if a protocol decoder");
             Console.WriteLine("plugin is installed, its decoded frames and their timing.");
@@ -1356,6 +1483,31 @@ internal class Program
         }
 
         _channelCount = enabledChannels.Length;
+
+        if (fromRaw)
+        {
+            if (!File.Exists(outPath))
+            {
+                Console.Error.WriteLine($"--from-raw: {outPath} does not exist.");
+                return;
+            }
+            // The capture length follows from the file, not from [seconds]; the start time is only
+            // known approximately (the file's write time minus that length), which matters for pcap
+            // wall-clock stamps and nothing else - every interval is still sample-accurate.
+            long fileBytes = new FileInfo(outPath).Length;
+            double seconds = fileBytes * 8.0 / enabledChannels.Length / sampleRateHz;
+            var startUtc = File.GetLastWriteTimeUtc(outPath) - TimeSpan.FromSeconds(seconds);
+            Console.WriteLine(string.Format(Inv,
+                "--from-raw: {0}, {1} channel(s), {2:F3} s at {3} MHz; no device is opened.",
+                outPath, enabledChannels.Length, seconds, sampleRateHz / 1e6));
+            if (pcapStreamTarget is not null)
+                _pcapSink = PcapSink.Open(pcapStreamTarget, 60.0);
+            AnalyzeCapture(outPath, sampleRateHz, seconds, enabledChannels, decodeBauds, decodeChannels,
+                           framing, wantVcd, wantPcap, pcapStreamTarget, startUtc, writeDemuxed: false);
+            _pcapSink?.Dispose();
+            _pcapSink = null;
+            return;
+        }
 
         // Firmware/FPGA resource dir - the official DSView install already has
         // DSLogicU3Pro16.bin (the FPGA bitstream this model needs). No matching
@@ -1639,6 +1791,34 @@ internal class Program
             return;
         }
 
+        AnalyzeCapture(outPath, sampleRateHz, durationSeconds, enabledChannels, decodeBauds, decodeChannels,
+                       framing, wantVcd, wantPcap, pcapStreamTarget, captureStartUtc, writeDemuxed: true);
+
+        // Flush and close the stream sink before releasing the device, so a reader on the other end
+        // of the pipe sees every frame this run decoded rather than losing the tail.
+        if (_pcapSink is not null)
+        {
+            Console.WriteLine($"[stream] closing after {_pcapSink.FramesWritten} frame(s).");
+            _pcapSink.Dispose();
+            _pcapSink = null;
+        }
+
+        Native.ds_release_actived_device();
+        Native.ds_lib_exit();
+    }
+
+    // Everything after the bytes are on disk: demux, per-channel summary, UART decode, protocol
+    // frames, timing and burst analysis. Separate from Main so --from-raw can run it on a capture
+    // taken earlier, without the analyser attached.
+    private static void AnalyzeCapture(string outPath, ulong sampleRateHz, double durationSeconds,
+                                       int[] enabledChannels, int[] decodeBauds, int[] decodeChannels,
+                                       ParityMode framing, bool wantVcd, bool wantPcap, string? pcapStreamTarget,
+                                       DateTime captureStartUtc, bool writeDemuxed)
+    {
+        // The first rate is the primary one: it is what the protocol decoder and the timing analysis
+        // are told when a byte carries no rate of its own.
+        int decodeBaud = decodeBauds.Length > 0 ? decodeBauds[0] : 0;
+
         // ---- demux + report -----------------------------------------------------------------
         var rawAll = File.ReadAllBytes(outPath);
         long expected = (long)(sampleRateHz * durationSeconds) * enabledChannels.Length / 8;
@@ -1660,7 +1840,7 @@ internal class Program
                 prev = cur;
             }
             string path = $"{_outBaseName}.ch{enabledChannels[i]}.raw";
-            File.WriteAllBytes(path, chBytes);
+            if (writeDemuxed) File.WriteAllBytes(path, chBytes);
             double duty = samples > 0 ? (double)high / samples : 0;
             string hint = toggles == 0 ? "  (flat - likely unconnected)"
                         : duty > 0.9 ? "  (idles high - looks like a UART line)"
@@ -1703,8 +1883,19 @@ internal class Program
                 // exact reverse, at identical timestamps - same signal, opposite polarity).
                 // With no decoder loaded there are no frames to count, so fall back to which
                 // polarity produced fewer framing errors - weaker, but still better than assuming.
-                var bytesNormal = DecodeUart(perCh[idx], sampleRateHz, decodeBaud, invert: false, parity: framing);
-                var bytesInvert = DecodeUart(perCh[idx], sampleRateHz, decodeBaud, invert: true,  parity: framing);
+                bool multiRate = decodeBauds.Length > 1;
+                List<DecodedByte> bytesNormal, bytesInvert;
+                List<RateSegment> segNormal = new(), segInvert = new();
+                if (multiRate)
+                {
+                    (bytesNormal, segNormal) = DecodeUartMultiRate(perCh[idx], sampleRateHz, decodeBauds, invert: false, framing);
+                    (bytesInvert, segInvert) = DecodeUartMultiRate(perCh[idx], sampleRateHz, decodeBauds, invert: true,  framing);
+                }
+                else
+                {
+                    bytesNormal = DecodeUart(perCh[idx], sampleRateHz, decodeBaud, invert: false, parity: framing);
+                    bytesInvert = DecodeUart(perCh[idx], sampleRateHz, decodeBaud, invert: true,  parity: framing);
+                }
                 int nNormal, nInvert;
                 string unit;
                 if (decoder is not null)
@@ -1731,8 +1922,9 @@ internal class Program
                     ParityMode.Odd  => "8-O-1",
                     _               => "8-N-1",
                 };
-                Console.WriteLine($"[decode] ch{ch} @ {decodeBaud} baud {framingName}: {bytes.Count} byte(s), " +
+                Console.WriteLine($"[decode] ch{ch} @ {string.Join("/", decodeBauds)} baud {framingName}: {bytes.Count} byte(s), " +
                                   $"{nFraming} framing error(s), {nParity} parity error(s)");
+                if (multiRate) ReportRates($"ch{ch}", useInvert ? segInvert : segNormal, decodeBauds);
                 if (bytes.Count > 0)
                 {
                     var sb = new System.Text.StringBuilder();
@@ -1742,10 +1934,12 @@ internal class Program
                     // InvariantCulture matters here: on a Dutch-locale machine the default would
                     // write "0,724999380" and the file would not parse as numeric data.
                     string txt = $"{_outBaseName}.ch{ch}.uart.txt";
+                    // A fifth column, the rate the byte was read at, only when several were given:
+                    // a single-rate run keeps the four-column file existing readers expect.
                     using (var w = new StreamWriter(txt))
                         foreach (var b in bytes)
-                            w.WriteLine(string.Format(Inv, "{0:F9}	{1:X2}	{2}	{3}",
-                                b.Time, b.Value, b.FramingOk ? "ok" : "FRAMING", b.ParityOk ? "ok" : "PARITY"));
+                            w.WriteLine(string.Format(Inv, multiRate ? "{0:F9}	{1:X2}	{2}	{3}	{4}" : "{0:F9}	{1:X2}	{2}	{3}",
+                                b.Time, b.Value, b.FramingOk ? "ok" : "FRAMING", b.ParityOk ? "ok" : "PARITY", b.Baud));
                     Console.WriteLine($"  -> {txt}");
 
                     IReadOnlyList<ProtocolFrame> frames = Array.Empty<ProtocolFrame>();
@@ -1804,9 +1998,12 @@ internal class Program
                     // only 1.41 ms and 1.61 ms). One character time separates them cleanly and
                     // exposes the ~0.1 ms device turnaround, while still being long enough not to
                     // split a single transmission at its inter-byte spacing.
-                    double charT = 11.0 / decodeBaud;
+                    // With several rates: the gap is a character at the slowest one (a shorter gap
+                    // would split slow characters), the glitch limit a fifth of a bit at the fastest
+                    // (a longer one would swallow fast bits). One rate gives the same as before.
+                    double charT = 11.0 / decodeBauds.Min();
                     var bursts = FindBursts(perCh[idx], sampleRateHz, 1.0 * charT,
-                                            (int)((double)sampleRateHz / decodeBaud / 5.0));
+                                            (int)((double)sampleRateHz / decodeBauds.Max() / 5.0));
                     AnalyzeBursts($"ch{ch}", bursts, frames);
 
                     string bcsv = $"{_outBaseName}.ch{ch}.bursts.csv";
@@ -1887,16 +2084,5 @@ internal class Program
             }
         }
 
-        // Flush and close the stream sink before releasing the device, so a reader on the other end
-        // of the pipe sees every frame this run decoded rather than losing the tail.
-        if (_pcapSink is not null)
-        {
-            Console.WriteLine($"[stream] closing after {_pcapSink.FramesWritten} frame(s).");
-            _pcapSink.Dispose();
-            _pcapSink = null;
-        }
-
-        Native.ds_release_actived_device();
-        Native.ds_lib_exit();
     }
 }

@@ -98,6 +98,46 @@ Writes `<base>.raw`, `<base>.chN.raw`, and — when `decodeBaud` is given —
 `<base>.chN.uart.txt`, `<base>.chN.bursts.csv`, and `<base>.chN.frames.csv` if a decoder plugin
 is installed. `--vcd` adds `<base>.vcd`; `--pcap` adds `<base>.chN.pcap`.
 
+### A bus that changes rate mid-capture
+
+`decodeBaud` may be a comma-separated list. Each stretch of activity is then decoded at every
+listed rate, and the rate with the fewest framing and parity errors wins (ties go to the earlier
+rate in the list). The first rate is the primary one: the protocol decoder receives it as its
+default.
+
+```sh
+DslCli capture.raw 25000000 20 3 115200,250000 3 0 --framing 8E1
+```
+
+- **Segments are cut only at long idle gaps:** more than 12 bit times at the slowest rate. No idle
+  stretch inside a character is that long, so a cut always falls between characters. A request and
+  its answer usually share a segment. That does no harm, because both sides of an exchange use the
+  same rate.
+- **Ringing is ignored:** pulses shorter than a quarter bit at the fastest rate don't count when
+  looking for those gaps.
+- **Every decoded byte records its rate:** `DecodedByte.Baud`. A decoder should use that rate for
+  frame end times and byte gaps. The rate passed to `Decode` is only the default.
+- **Output:** `uart.txt` gets a fifth column with the rate (only with more than one rate). stdout
+  gains a `[rates]` block with the segment count per rate, each rate change, and the segments that
+  read cleanly at no rate. That last list is where a byte sent at the wrong rate shows up.
+
+Measured on a GeoBUS capture with a 115200 → 250000 switch (2026-11-19, 25 MHz, 20 s): 3190
+CRC-valid frames with both rates against 1585 at 115200 alone, and the three rate changes at the
+same instants as a hand analysis.
+
+### Analysing a capture again: `--from-raw`
+
+`--from-raw` opens no device: it runs the decode and analysis on `<out.raw>` as it is on disk. The
+file must have been captured with `[channels]` enabled at `[rate]`; `[secs]` is ignored, because the
+length follows from the file size. A demuxed `<base>.chN.raw` is a one-channel capture, so pass `N`
+alone as `[channels]`. In this mode the per-channel `.raw` files are not written again, and pcap
+wall-clock stamps are approximate (file write time minus capture length). Intervals stay exact
+to the sample.
+
+```sh
+DslCli bs1.ch3.raw 25000000 0 3 115200,250000 3 0 --framing 8E1 --from-raw
+```
+
 ### Triggering
 
 `--trigger` takes comma-separated `chK=COND` clauses; the `ch` prefix is optional and channels
