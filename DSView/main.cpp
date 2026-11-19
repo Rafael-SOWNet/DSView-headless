@@ -27,6 +27,7 @@
 #include <QStyle> 
 #include <QGuiApplication>
 #include <QScreen>
+#include <QImageReader>
 #include "dsapplication.h"
 #include "mystyle.h" 
 #include "pv/mainframe.h"
@@ -178,6 +179,9 @@ bool bHighScale = true;
     QApplication::setApplicationName("DSView");
     QApplication::setOrganizationName("DreamSourceLab");
     QApplication::setOrganizationDomain("www.DreamSourceLab.com");
+    // Wayland app_id / taskbar matching: must equal the installed desktop file's
+    // basename, which is also the AppStream component id.
+    QGuiApplication::setDesktopFileName("io.github.schildkroet.dsview");
 
 	//----------------------init log
 	dsv_log_init(); // Don't call before QApplication be inited
@@ -216,6 +220,15 @@ bool bHighScale = true;
 	//----------------------run
 	dsv_info("----------------- version: %s-----------------", DS_VERSION_STRING);
 	dsv_info("Qt:%s", QT_VERSION_STR);
+
+	// The themes draw every checkbox, radio button, combobox arrow and window
+	// button from SVG resources. Decoding those needs Qt's qsvg image plugin
+	// (Debian: libqt6svg6, Fedora: qt6-qtsvg). Qt reports nothing when it is
+	// absent - it just hands out null pixmaps and the controls come up blank,
+	// so say it here rather than leave the user with an unexplained UI.
+	if (!QImageReader::supportedImageFormats().contains("svg")){
+		dsv_warn("Qt svg image plugin missing, icons and checkboxes will not be drawn. Please install it (e.g. libqt6svg6).");
+	}
 
 	QDateTime dateTime = QDateTime::currentDateTime();
 	std::string strTime = dateTime .toString("yyyy-MM-dd hh:mm:ss").toStdString();

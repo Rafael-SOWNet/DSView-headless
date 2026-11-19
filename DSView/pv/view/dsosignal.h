@@ -26,6 +26,7 @@
 
 #include "signal.h"
 #include "../dstimer.h"
+#include <QDateTime>
   
 namespace pv {
 namespace data {
@@ -125,6 +126,7 @@ public:
     void set_vDialActive(bool active);
     bool go_vDialPre(bool manul);
     bool go_vDialNext(bool manul); 
+    bool go_attenStep(int dir);
 
     inline dslDial *get_vDial(){
         return _vDial;
@@ -293,6 +295,25 @@ private:
     uint8_t _min;
     double _period;
     bool _level_valid;
+    // Set once compute_soft_measure() has logged that it is substituting for
+    // missing hardware cycle data, so repeated repaints don't spam the log.
+    // Cleared again once the hardware reports valid cycle data.
+    bool _soft_measure_logged;
+
+    // Identifies the dataset compute_soft_measure() last computed its result
+    // for, so it can skip re-scanning the sample buffer on repaints that
+    // don't follow a new acquisition (e.g. hover/cursor redraws while the
+    // hardware measurement stays invalid for many consecutive frames).
+    // get_trig_time() changes on every new capture even when the configured
+    // sample depth (and so get_sample_count()) stays the same between runs,
+    // which a count-only check would miss. Within one continuous run neither
+    // changes between frames, so the session's DSO packet sequence number is
+    // part of the key as well.
+    bool _soft_measure_cache_valid;
+    const pv::data::DsoSnapshot *_soft_measure_cache_data;
+    uint64_t _soft_measure_cache_sample_count;
+    QDateTime _soft_measure_cache_trig_time;
+    uint64_t _soft_measure_cache_seq;
     uint8_t _high;
     uint8_t _low;
     double _rms;

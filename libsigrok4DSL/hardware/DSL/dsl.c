@@ -78,7 +78,39 @@ SR_PRIV void dsl_probe_init(struct sr_dev_inst *sdi)
     for (l = sdi->channels; l; l = l->next) {
         struct sr_channel *probe = (struct sr_channel *)l->data;
         probe->bits = channel_modes[devc->ch_mode].unit_bits;
+
+        /*
+         * Default vertical range. This MUST be a value the profile actually
+         * offers: DsoSignal builds its dial from dev_caps.vdivs and then feeds
+         * this back in through set_value(), which asserts the value is in the
+         * list. A hardcoded 1000 mV only worked because every stock profile
+         * happens to include it - a device whose ranges are not round numbers
+         * (DSO_E8-1, whose front-end gain is folded into its vdivs) crashed
+         * here instead.
+         *
+         * Pick the entry nearest 1 V so stock devices keep their previous
+         * default, and anything else gets a sane mid-scale range.
+         */
         probe->vdiv = 1000;
+
+        if (devc->profile->dev_caps.vdivs) {
+            uint64_t best = 0;
+            uint64_t best_err = UINT64_MAX;
+
+            for (i = 0; devc->profile->dev_caps.vdivs[i]; i++) {
+                const uint64_t v = devc->profile->dev_caps.vdivs[i];
+                const uint64_t err = (v > 1000) ? (v - 1000) : (1000 - v);
+
+                if (err < best_err) {
+                    best_err = err;
+                    best = v;
+                }
+            }
+
+            if (best != 0)
+                probe->vdiv = best;
+        }
+
         probe->vfactor = 1;
         probe->cali_fgain0 = 1;
         probe->cali_fgain1 = 1;
@@ -196,18 +228,36 @@ SR_PRIV const GSList *dsl_mode_list(const struct sr_dev_inst *sdi)
     return l;
 }
 
+/**
+ * The sample-rate list for the device's current channel mode.
+ *
+ * Every profile has one list, except DSO_E8-1 in logic mode: its profile list
+ * stops at the analog front end's 32 MHz, which the logic probes bypass.
+ * samplerates_min_index/max_index index into whatever this returns, so every
+ * reader of them must go through here too.
+ */
+SR_PRIV const uint64_t *dsl_samplerates(const struct DSL_context *devc)
+{
+    if ((devc->profile->dev_caps.vga_id == DSL_VGA_ID_E8) &&
+        (channel_modes[devc->ch_mode].mode == LOGIC))
+        return samplerates_logic_e8;
+
+    return devc->profile->dev_caps.samplerates;
+}
+
 SR_PRIV void dsl_adjust_samplerate(struct DSL_context *devc)
 {
+    const uint64_t *samplerates = dsl_samplerates(devc);
     int i;
-    for (i = 0; devc->profile->dev_caps.samplerates[i]; i++) {
-        if (devc->profile->dev_caps.samplerates[i] >
+    for (i = 0; samplerates[i]; i++) {
+        if (samplerates[i] >
                 channel_modes[devc->ch_mode].max_samplerate)
             break;
     }
     devc->samplerates_max_index = i-1;
 
-    for (i = 0; devc->profile->dev_caps.samplerates[i]; i++) {
-        if (devc->profile->dev_caps.samplerates[i] >=
+    for (i = 0; samplerates[i]; i++) {
+        if (samplerates[i] >=
                 channel_modes[devc->ch_mode].min_samplerate)
             break;
     }
@@ -215,11 +265,11 @@ SR_PRIV void dsl_adjust_samplerate(struct DSL_context *devc)
 
     assert(devc->samplerates_max_index >= devc->samplerates_min_index);
 
-    if (devc->cur_samplerate > devc->profile->dev_caps.samplerates[devc->samplerates_max_index])
-        devc->cur_samplerate = devc->profile->dev_caps.samplerates[devc->samplerates_max_index];
+    if (devc->cur_samplerate > samplerates[devc->samplerates_max_index])
+        devc->cur_samplerate = samplerates[devc->samplerates_max_index];
 
-    if (devc->cur_samplerate < devc->profile->dev_caps.samplerates[devc->samplerates_min_index])
-        devc->cur_samplerate = devc->profile->dev_caps.samplerates[devc->samplerates_min_index];
+    if (devc->cur_samplerate < samplerates[devc->samplerates_min_index])
+        devc->cur_samplerate = samplerates[devc->samplerates_min_index];
 }
 
 SR_PRIV int dsl_en_ch_num(const struct sr_dev_inst *sdi)
@@ -236,68 +286,94 @@ SR_PRIV int dsl_en_ch_num(const struct sr_dev_inst *sdi)
     return channel_en_cnt;
 }
 
+/* Whether a failed request means that the device does not answer (yet). */
+static gboolean dsl_no_answer(int ret)
+{
+    return ret == LIBUSB_ERROR_TIMEOUT || ret == LIBUSB_ERROR_IO
+        || ret == LIBUSB_ERROR_NO_DEVICE || ret == LIBUSB_ERROR_BUSY;
+}
+
 /**
  * Check the USB configuration to determine if this is an dsl device.
  *
- * @return TRUE if the device's configuration profile match dsl hardware
- *         configuration, FALSE otherwise.
+ * Right after it is plugged, a device may not answer yet: that is not the
+ * same as missing firmware, and uploading firmware to a device that boots it
+ * from flash can hang it.
+ *
+ * @return DSL_PROFILE_FIRMWARE if the device runs the dsl firmware,
+ *         DSL_PROFILE_NO_FIRMWARE if it answers without the dsl strings,
+ *         DSL_PROFILE_NOT_READY if it does not answer.
  */
-SR_PRIV gboolean dsl_check_conf_profile(libusb_device *dev)
+SR_PRIV int dsl_check_conf_profile(libusb_device *dev)
 {
     struct libusb_device_descriptor des;
     struct libusb_device_handle *hdl;
     int ret;
-    gboolean bSucess;
+    int status;
+    int tries;
     unsigned char strdesc[64];
+    const char *manufacturer;
+    const char *product;
 
-    hdl = NULL;
-    bSucess = FALSE;
-    ret = 0;
+    status = DSL_PROFILE_NOT_READY;
 
-    while (!bSucess) {
+    for (tries = 0; tries < 3 && status == DSL_PROFILE_NOT_READY; tries++) {
+        if (tries > 0)
+            g_usleep(300 * 1000);
+
+        hdl = NULL;
         /* Assume the FW has not been loaded, unless proven wrong. */
+        status = DSL_PROFILE_NO_FIRMWARE;
+
         if ((ret = libusb_get_device_descriptor(dev, &des)) < 0){
             sr_err("%s:%d, Failed to get device descriptor: %s", 
 			    __func__, __LINE__, libusb_error_name(ret));
             break;
         }
 
+        /* DSO_E8-1 carries its own strings; everything else keeps DreamSourceLab's. */
+        if (des.idVendor == DSL_E8_VID && des.idProduct == DSL_E8_PID) {
+            manufacturer = DSL_E8_MANUFACTURER;
+            product = DSL_E8_PRODUCT;
+        }
+        else {
+            manufacturer = "DreamSourceLab";
+            product = "USB-based DSL Instrument v2";
+        }
+
         if ((ret = libusb_open(dev, &hdl)) < 0){
             sr_err("%s:%d, Failed to open device: %s", 
 			    __func__, __LINE__, libusb_error_name(ret));
             // Mybe the device is busy, add it to list.
-            return TRUE;
+            return DSL_PROFILE_FIRMWARE;
         }
 
         if ((ret = libusb_get_string_descriptor_ascii(hdl,
                 des.iManufacturer, strdesc, sizeof(strdesc))) < 0){
             sr_err("%s:%d, Failed to get device descriptor ascii: %s", 
 			    __func__, __LINE__, libusb_error_name(ret));
-            break;
+            if (dsl_no_answer(ret))
+                status = DSL_PROFILE_NOT_READY;
+        }
+        else if (strncmp((const char *)strdesc, manufacturer, strlen(manufacturer)) == 0) {
+            if ((ret = libusb_get_string_descriptor_ascii(hdl,
+                    des.iProduct, strdesc, sizeof(strdesc))) < 0){
+                sr_err("%s:%d, Failed to get device descriptor ascii: %s", 
+                    __func__, __LINE__, libusb_error_name(ret));
+                if (dsl_no_answer(ret))
+                    status = DSL_PROFILE_NOT_READY;
+            }
+            else if (strncmp((const char *)strdesc, product, strlen(product)) == 0) {
+                /* If we made it here, it must be an dsl device. */
+                status = DSL_PROFILE_FIRMWARE;
+            }
         }
 
-        if (strncmp((const char *)strdesc, "DreamSourceLab", 14))
-            break;
-
-        if ((ret = libusb_get_string_descriptor_ascii(hdl,
-                des.iProduct, strdesc, sizeof(strdesc))) < 0){
-            sr_err("%s:%d, Failed to get device descriptor ascii: %s", 
-			    __func__, __LINE__, libusb_error_name(ret));
-            break;
-        }
-
-        if (strncmp((const char *)strdesc, "USB-based DSL Instrument v2", 27))
-            break;
-
-        /* If we made it here, it must be an dsl device. */
-        bSucess = TRUE;
-    }
-
-    if (hdl){
         libusb_close(hdl);
+        hdl = NULL;
     }
 
-    return bSucess;
+    return status;
 }
 
 static int hw_dev_open(struct sr_dev_driver *di, struct sr_dev_inst *sdi)
@@ -420,12 +496,15 @@ SR_PRIV int dsl_configure_probes(const struct sr_dev_inst *sdi)
 
         stage = 0;
         for (tc = probe->trigger; *tc; tc++) {
+            /* Check before writing: a check after stage++ either lets one
+             * stage too many overflow the tables (>) or rejects a trigger
+             * using exactly all of them (>=). */
+            if (stage >= NUM_TRIGGER_STAGES)
+                return SR_ERR;
             devc->trigger_mask[stage] |= probe_bit;
             if (*tc == '1')
                 devc->trigger_value[stage] |= probe_bit;
             stage++;
-            if (stage > NUM_TRIGGER_STAGES)
-                return SR_ERR;
         }
     }
 
@@ -1783,7 +1862,7 @@ SR_PRIV int dsl_config_list(int key, GVariant **data, const struct sr_dev_inst *
             g_variant_builder_add(&gvb, "t", devc->ext_samplerate);
         }
         for(int i = devc->samplerates_min_index; i <= devc->samplerates_max_index; i++) {
-            g_variant_builder_add(&gvb, "t", devc->profile->dev_caps.samplerates[i]);
+            g_variant_builder_add(&gvb, "t", dsl_samplerates(devc)[i]);
         }
         GVariant *list = g_variant_builder_end(&gvb);
         g_variant_builder_init(&gvb, G_VARIANT_TYPE("a{sv}"));
@@ -1974,11 +2053,33 @@ SR_PRIV int dsl_dev_open(struct sr_dev_driver *di, struct sr_dev_inst *sdi, gboo
     return SR_OK;
 }
 
+/*
+ * Stop the USB event thread of a Windows acquisition, see usb_event_thread().
+ * A stopped capture leaves it running to reap the cancelled transfers, so it
+ * is also stopped before the next capture and when the device is closed.
+ */
+SR_PRIV void dsl_stop_usb_event_thread(const struct sr_dev_inst *sdi)
+{
+    struct DSL_context *devc = sdi->priv;
+    struct drv_context *drvc = sdi->driver->priv;
+
+    if (devc == NULL || devc->usb_thread == NULL)
+        return;
+
+    devc->usb_thread_quit = TRUE;
+    /* Return from libusb_handle_events_timeout_completed() now. */
+    libusb_interrupt_event_handler(drvc->sr_ctx->libusb_ctx);
+    g_thread_join(devc->usb_thread);
+    devc->usb_thread = NULL;
+}
+
 SR_PRIV int dsl_dev_close(struct sr_dev_inst *sdi)
 {
     struct sr_usb_dev_inst *usb;
 
     assert(sdi);
+
+    dsl_stop_usb_event_thread(sdi);
 
     usb = sdi->conn;
 
@@ -2156,9 +2257,14 @@ SR_PRIV unsigned int dsl_get_timeout(const struct sr_dev_inst *sdi)
     timeout = total_size / to_bytes_per_ms(devc);
 
     if (devc->stream)
-        return timeout + timeout / 4; /* Leave a headroom of 25% percent. */
+        timeout += timeout / 4; /* Leave a headroom of 25% percent. */
     else
-        return 20;
+        timeout = 20;
+
+    /* Callers use this as a poll/sleep interval; the integer division above
+     * truncates to 0 for small buffers at high sample rates, which would turn
+     * those waits into busy-loops. */
+    return max(timeout, 1u);
 }
 
 static void finish_acquisition(struct DSL_context *devc)
@@ -2334,6 +2440,8 @@ static void receive_transfer(struct libusb_transfer *transfer)
     case LIBUSB_TRANSFER_TIMED_OUT: /* We may have received some data though. */
         break;
     default:
+        sr_err("%s: transfer failed, libusb status %d after %d bytes", __func__,
+               transfer->status, transfer->actual_length);
         devc->status = DSL_ERROR;
         break;
     }
@@ -2365,6 +2473,20 @@ static void receive_transfer(struct libusb_transfer *transfer)
                 devc->mstatus_valid = TRUE;
             }
 
+            /* Per-transfer trace: runs once per completed bulk transfer, so it
+             * is confined to DSO_E8-1, where it is the bring-up aid for the
+             * firmware's status block. Stock hardware never pays for it. */
+            if (devc->profile->dev_caps.vga_id == DSL_VGA_ID_E8) {
+                sr_info("%s: DSO transfer: %d bytes, mstatus_valid %d, pkt_id 0x%04X, vlen %u, "
+                        "divider %u (expected %u), num_samples %llu / actual %llu, instant %d, en_ch %d",
+                        __func__, transfer->actual_length, devc->mstatus_valid,
+                        devc->mstatus.pkt_id, devc->mstatus.vlen, devc->mstatus.sample_divider,
+                        (unsigned)(devc->zero ? 1 : (uint32_t)ceil(channel_modes[devc->ch_mode].max_samplerate * 1.0 /
+                                                                   devc->cur_samplerate / dsl_en_ch_num(sdi))),
+                        (unsigned long long)devc->num_samples, (unsigned long long)devc->actual_samples,
+                        devc->instant, dsl_en_ch_num(sdi));
+            }
+
             if (devc->mstatus_valid) {
                 devc->roll = (devc->mstatus.stream_mode != 0);
                 packet.type = SR_DF_DSO;
@@ -2381,6 +2503,14 @@ static void receive_transfer(struct libusb_transfer *transfer)
                 dso.data = cur_buf + (devc->zero ? 0 : 2*devc->mstatus.trig_offset);
             }
             else {
+                sr_warn("%s: invalid DSO packet dropped: %d bytes, pkt_id 0x%04X (expected 0x%04X), "
+                        "vlen %u, divider %u (expected %u), instant %d, zero %d, samplerate %llu, en_ch %d",
+                        __func__, transfer->actual_length,
+                        devc->mstatus.pkt_id, DSO_PKTID, devc->mstatus.vlen, devc->mstatus.sample_divider,
+                        (unsigned)(devc->zero ? 1 : (uint32_t)ceil(channel_modes[devc->ch_mode].max_samplerate * 1.0 /
+                                                                   devc->cur_samplerate / dsl_en_ch_num(sdi))),
+                        devc->instant, devc->zero, (unsigned long long)devc->cur_samplerate,
+                        dsl_en_ch_num(sdi));
                 packet.type = SR_DF_DSO;
                 packet.status = SR_PKT_DATA_ERROR;
             }
@@ -2480,7 +2610,10 @@ static void receive_header(struct libusb_transfer *transfer)
             }
         }
     } else if (!devc->abort) {
-        sr_err("%s: trigger packet data error.", __func__);
+        sr_err("%s: trigger packet data error. transfer status %d, received %d bytes (expected %d), "
+               "check_id 0x%08X (expected 0x%08X)", __func__,
+               transfer->status, transfer->actual_length, dsl_header_size(devc),
+               trigger_pos->check_id, TRIG_CHECKID);
         packet.type = SR_DF_TRIGGER;
         packet.payload = trigger_pos;
         packet.status = SR_PKT_DATA_ERROR;

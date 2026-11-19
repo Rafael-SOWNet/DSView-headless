@@ -46,6 +46,7 @@
 #include "../dsvdef.h" 
 #include "../interface/icallbacks.h"
 #include "../ui/uimanager.h"
+#include "wheelaccumulator.h"
 
 class DeviceAgent;
 
@@ -333,6 +334,10 @@ public:
     QRect get_view_rect();
     int get_view_width();
     int get_view_height();
+    // How many pixels of the viewport's bottom edge the status/measurement
+    // bar paints over. It is not inside the scroll area's viewport, it floats
+    // on top of it, so anything drawn there is hidden.
+    int get_status_overlap();
 
     double get_hori_res();
 
@@ -405,6 +410,14 @@ private:
     static bool compare_trace_v_offsets( const Trace *a, const Trace *b);
     void get_scroll_layout(int64_t &length, int64_t &offset);	
 	void update_scroll();
+    // Height of the scrollable time pane that is actually visible, i.e. clear
+    // of the status bar. LOGIC only - in DSO get_view_height() already
+    // reports the (overlap-free) grid height, so this would subtract twice.
+    int get_time_pane_height();
+    // Nearest vertical scroll position at which the bottom edge of the time
+    // pane lines up with the end of a trace band, so nothing overlapping the
+    // bottom of the pane can slice the lowest trace in half.
+    int snap_v_offset(int value);
     void update_margins();
     // Re-reserves bottom/right space in _statusLayout for the real
     // scrollbars, using their current (not construction-time) geometry -
@@ -467,6 +480,7 @@ private slots:
 
 	void h_scroll_value_changed(int value);
 	void v_scroll_value_changed(int value);
+	void on_v_scroll_released();
 
 	void marker_time_changed();
     void on_traces_moved();   
@@ -526,8 +540,13 @@ private:
     int         _spanY;
     int         _signalHeight;
     double      _trace_height_factor;
+
+    // Collects sub-detent wheel steps so high-resolution wheels can still
+    // advance the (discrete) DSO horizontal knob.
+    WheelAccumulator _dso_zoom_accum{1.0};
     bool        _dso_split_channels;
     bool        _updating_scroll;
+    bool        _snapping_v_scroll;
 
     // trigger position fix
     double      _trig_hoff;

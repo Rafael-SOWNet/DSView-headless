@@ -21,6 +21,17 @@
 
 cmake_minimum_required(VERSION 3.10)
 
+# Keep the source tree clean: all generated files (moc_*, qrc_*, config.h,
+# Makefiles, the executable) belong in a separate build directory.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
+    message(FATAL_ERROR
+        "In-source builds are not allowed. Build in ./build instead:\n"
+        "  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release\n"
+        "  cmake --build build\n"
+        "(or just run `make`). CMake has already created CMakeCache.txt and "
+        "CMakeFiles/ here - delete them: rm -rf CMakeCache.txt CMakeFiles")
+endif()
+
 project(DSView)
 
 #===============================================================================
@@ -31,8 +42,8 @@ set(DS_TITLE DSView)
 set(DS_DESCRIPTION "A GUI for instruments of DreamSourceLab")
 
 set(DS_VERSION_MAJOR 1)
-set(DS_VERSION_MINOR 5)
-set(DS_VERSION_MICRO 0)
+set(DS_VERSION_MINOR 6)
+set(DS_VERSION_MICRO 1)
 set(DS_VERSION_STRING  ${DS_VERSION_MAJOR}.${DS_VERSION_MINOR}.${DS_VERSION_MICRO})
 
 configure_file (
@@ -178,6 +189,24 @@ message(STATUS "	 libraries:" ${ZLIB_LIBRARIES})
 include_directories(${ZLIB_INCLUDE_DIRS})
 
 #===============================================================================
+#= Qt Svg
+#
+# DSView never calls a Qt Svg function - it only needs the qsvg image and icon
+# engine plugins that ship with the module. A plain link would therefore be
+# thrown away again by --as-needed (the default on most Linux distros), and
+# with no DT_NEEDED entry, dpkg-shlibdeps and the AppImage/DLL bundlers cannot
+# tell that libqt6svg6 has to come along. Keep the link explicitly on ELF
+# targets so the runtime dependency is recorded.
+#-------------------------------------------------------------------------------
+macro(ds_link_qt_svg svg_target)
+    if(UNIX AND NOT APPLE)
+        list(APPEND QT_LIBRARIES -Wl,--no-as-needed ${svg_target} -Wl,--as-needed)
+    else()
+        list(APPEND QT_LIBRARIES ${svg_target})
+    endif()
+endmacro()
+
+#===============================================================================
 #= Qt6 or Qt5
 #
 # Prioritize Qt6 for better font rendering on OSX, better Wayland compatibility
@@ -190,9 +219,15 @@ if(Qt6Core_FOUND)
     message(STATUS "	 includes:" ${Qt6Core_INCLUDE_DIRS})
     find_package(Qt6Widgets REQUIRED)
     find_package(Qt6Gui REQUIRED)
+    # The themes and icons are SVG, which Qt can only decode through the qsvg
+    # image/icon engine plugins shipping with the Qt Svg module. Requiring it
+    # here turns a missing module into a configure error instead of a UI whose
+    # checkboxes, combobox arrows and window buttons are silently not painted.
+    find_package(Qt6Svg REQUIRED)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${Qt6Widgets_EXECUTABLE_COMPILE_FLAGS}")
-    set(QT_INCLUDE_DIRS ${Qt6Gui_INCLUDE_DIRS} ${Qt6Widgets_INCLUDE_DIRS})
+    set(QT_INCLUDE_DIRS ${Qt6Gui_INCLUDE_DIRS} ${Qt6Widgets_INCLUDE_DIRS} ${Qt6Svg_INCLUDE_DIRS})
     set(QT_LIBRARIES Qt6::Gui Qt6::Widgets)
+    ds_link_qt_svg(Qt6::Svg)
     if(WIN32)
         find_package(Qt6Core5Compat REQUIRED)
         add_definitions(${Qt6Core5Compat_DEFINITIONS})
@@ -209,9 +244,11 @@ if(Qt5Core_FOUND)
     message(STATUS "	 includes:" ${Qt5Core_INCLUDE_DIRS})
     find_package(Qt5Widgets REQUIRED)
     find_package(Qt5Gui REQUIRED)
+    find_package(Qt5Svg REQUIRED) # see the Qt6 branch above
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${Qt5Widgets_EXECUTABLE_COMPILE_FLAGS}")
-    set(QT_INCLUDE_DIRS ${Qt5Gui_INCLUDE_DIRS} ${Qt5Widgets_INCLUDE_DIRS})
+    set(QT_INCLUDE_DIRS ${Qt5Gui_INCLUDE_DIRS} ${Qt5Widgets_INCLUDE_DIRS} ${Qt5Svg_INCLUDE_DIRS})
     set(QT_LIBRARIES Qt5::Gui Qt5::Widgets)
+    ds_link_qt_svg(Qt5::Svg)
     add_definitions(${Qt5Gui_DEFINITIONS} ${Qt5Widgets_DEFINITIONS})
 endif()
 
@@ -369,8 +406,6 @@ set(DSView_SOURCES
 
 set(DSView_HEADERS
     DSView/mystyle.h
-    DSView/pv/log.h
-    DSView/pv/sigsession.h
     DSView/pv/mainwindow.h
     DSView/pv/dialogs/deviceoptions.h
     DSView/pv/prop/property.h
@@ -441,26 +476,12 @@ set(DSView_HEADERS
     DSView/pv/view/decodetrace.h
     DSView/pv/widgets/decodergroupbox.h
     DSView/pv/widgets/decodermenu.h
-    DSView/pv/config/appconfig.h
-    DSView/pv/appcontrol.h
     DSView/pv/dstimer.h
     DSView/pv/eventobject.h
-    DSView/pv/ZipMaker.h
-    DSView/pv/data/decode/annotationrestable.h
-    DSView/pv/data/decode/decoderstatus.h
     DSView/pv/dock/protocolitemlayer.h
-    DSView/pv/ui/msgbox.h
-    DSView/pv/ui/dscombobox.h
-    DSView/pv/dsvdef.h
-    DSView/pv/dialogs/applicationpardlg.h
     DSView/pv/dock/keywordlineedit.h
     DSView/pv/dock/searchcombobox.h
     DSView/pv/dialogs/decoderoptionsdlg.h
-    DSView/pv/utility/encoding.h
-    DSView/pv/utility/path.h
-    DSView/pv/utility/array.h
-    DSView/pv/deviceagent.h
-    DSView/pv/ui/fn.h
     DSView/pv/ui/xtoolbutton.h
 )
 
@@ -577,6 +598,9 @@ if(WIN32)
             DSView/pv/winnativewidget.h
             DSView/pv/winshadow.h
         )
+    # USB hotplug, libusb has none on Windows.
+    list(APPEND libsigrok4DSL_SOURCES libsigrok4DSL/win32/hotplug_win.c)
+    add_definitions(-DHAVE_EXTERN_INIT)
 endif()
 
 if(Qt5Core_FOUND)
@@ -616,8 +640,9 @@ include_directories(
 set(CMAKE_CXX_FLAGS "-Wall -Wextra")
 set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
-add_compile_options(-O3)
+set(CMAKE_CXX_FLAGS_RELEASE "-O2")
+set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG")
+add_compile_options(-O2)
 
 #===============================================================================
 #= Linker Configuration
@@ -636,6 +661,8 @@ set(DSVIEW_LINK_LIBS
 if(WIN32)
     # Workaround for a MinGW linking issue.
     list(APPEND PULSEVIEW_LINK_LIBS "-llzma -llcms2")
+    # CM_Register_Notification() for USB hotplug.
+    list(APPEND DSVIEW_LINK_LIBS cfgmgr32)
 endif()
 
 add_executable(${PROJECT_NAME}
@@ -660,8 +687,11 @@ if(ENABLE_COTIRE)
     cotire(${PROJECT_NAME})
 endif()
 
-message(STATUS "Output dir: ${CMAKE_CURRENT_SOURCE_DIR}/build.dir")
-set(EXECUTABLE_OUTPUT_PATH "${CMAKE_CURRENT_SOURCE_DIR}/build.dir")
+# Not the build dir root itself: <build>/DSView/ is already a directory
+# holding generated files (config.h, moc_*, qrc_*).
+set_target_properties(${PROJECT_NAME} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+message(STATUS "Output dir: ${CMAKE_BINARY_DIR}/bin")
 
 #===============================================================================
 #= Installation
@@ -695,9 +725,12 @@ else()
     install(FILES DSView/icons/logo.svg DESTINATION share/DSView RENAME logo.svg)
     install(FILES DSView/icons/logo.svg DESTINATION share/icons/hicolor/scalable/apps RENAME dsview.svg)
     install(FILES DSView/icons/logo.svg DESTINATION share/pixmaps RENAME dsview.svg)
+    # PNG for the AppImage's .DirIcon, which appimagetool can't make from SVG.
+    install(FILES DSView/icons/dsview-256.png DESTINATION share/icons/hicolor/256x256/apps RENAME dsview.png)
 
     if(CMAKE_SYSTEM_NAME MATCHES "Linux")
-        install(FILES DSView/DSView.desktop DESTINATION /usr/share/applications RENAME dsview.desktop)
+        install(FILES DSView/DSView.desktop DESTINATION /usr/share/applications RENAME io.github.schildkroet.dsview.desktop)
+        install(FILES DSView/io.github.schildkroet.dsview.appdata.xml DESTINATION /usr/share/metainfo)
 
         add_compile_definitions(_DEFAULT_SOURCE)
 
@@ -709,10 +742,17 @@ else()
             install(FILES DSView/DreamSourceLab.rules DESTINATION /etc/udev/rules.d RENAME 60-dreamsourcelab.rules)
         endif()
 
+        # Also ship a copy alongside the app itself (share/DSView, same as the
+        # other resources installed below), so it ends up inside the AppImage
+        # too - unlike the install() rules above, AppImage packaging has no
+        # way to place files outside its own AppDir, so this is the only copy
+        # an AppImage user has access to. MainFrame::show_driver_hint_once()
+        # looks for it here to give AppImage users a one-time copy-paste fix
+        # when the system-wide rule (installed above) isn't present.
+        install(FILES DSView/DreamSourceLab.rules DESTINATION share/DSView)
+
     endif()
 
-    install(FILES NEWS25 DESTINATION share/DSView RENAME NEWS25)
-    install(FILES NEWS31 DESTINATION share/DSView RENAME NEWS31)
     install(FILES ug25.pdf DESTINATION share/DSView RENAME ug25.pdf)
     install(FILES ug31.pdf DESTINATION share/DSView RENAME ug31.pdf)
 
@@ -734,6 +774,27 @@ set(CPACK_SOURCE_PACKAGE_FILE_NAME
     "${CMAKE_PROJECT_NAME}-${DS_VERSION_MAJOR}.${DS_VERSION_MINOR}.${DS_VERSION_MICRO}")
 set(CPACK_SOURCE_GENERATOR "TGZ")
 
+# Reload udev immediately after installing/removing the .deb, so the
+# 60-dreamsourcelab.rules permission fix (see the udev install() rules above)
+# takes effect without requiring a reboot or manual `udevadm` invocation.
+# CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA is ignored by every generator except DEB,
+# so this is safe to set unconditionally.
+set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
+    "${CMAKE_CURRENT_SOURCE_DIR}/DSView/packaging/debian/postinst"
+    "${CMAKE_CURRENT_SOURCE_DIR}/DSView/packaging/debian/postrm"
+)
+
+# Qt loads its platform plugins (libqxcb.so, libqwayland-*.so) via dlopen, so
+# shlibdeps can't see them. On Ubuntu 22.04 / Debian 12 they live in the
+# separate qt6-qpa-plugins package, which libqt6gui6 doesn't pull in - without
+# it the app aborts with "no Qt platform plugin could be initialized". Newer
+# releases ship them inside libqt6gui6t64 itself, hence the alternative.
+# CPack appends the shlibdeps-discovered dependencies to this list.
+if(Qt6Core_FOUND)
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS "qt6-qpa-plugins | libqt6gui6t64")
+    set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "qt6-wayland")
+endif()
+
 include(CPack)
 
 #===============================================================================
@@ -745,5 +806,7 @@ if(ENABLE_TESTS)
     enable_testing()
     add_test(test ${CMAKE_CURRENT_BINARY_DIR}/DSView/test/DSView-test)
 endif(ENABLE_TESTS)
+
+
 
 

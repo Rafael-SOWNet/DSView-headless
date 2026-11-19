@@ -24,6 +24,7 @@
 #include <QAction>
 #include <QLabel>
 #include <QAbstractItemView>
+#include <QStyleOptionComboBox>
 #include <math.h>
 #include <libusb-1.0/libusb.h>
 #include "../dialogs/deviceoptions.h"
@@ -90,6 +91,9 @@ namespace pv
             _sample_rate.setSizeAdjustPolicy(DsComboBox::AdjustToContents);
             _sample_count.setSizeAdjustPolicy(DsComboBox::AdjustToContents);
             _device_selector.setMaximumWidth(ComboBoxMaxWidth);
+            // The theme style sheet sets a min-width on combo boxes when the box
+            // is polished, which would override the fixed width set below.
+            _sample_rate.installEventFilter(this);
 
             //tr
             _run_stop_button.setObjectName("run_stop_button");
@@ -358,6 +362,10 @@ namespace pv
 
         void SamplingBar::set_sample_rate(uint64_t sample_rate)
         {
+            /* The list is ascending, so walking it backwards picks the highest
+             * rate that does not overrun the requested one. */
+            int index = -1;
+
             for (int i = _sample_rate.count() - 1; i >= 0; i--)
             {
                 uint64_t cur_index_sample_rate = _sample_rate.itemData(
@@ -365,10 +373,26 @@ namespace pv
                                                      .value<uint64_t>();
                 if (sample_rate >= cur_index_sample_rate)
                 {
-                    _sample_rate.setCurrentIndex(i);
+                    index = i;
                     break;
                 }
             }
+
+            /* Nothing in the list is slow enough - the device cannot fill the
+             * screen at this timebase. Take its slowest rate, which fills the
+             * most of it. Leaving the selection untouched (the original
+             * behaviour) made the rate depend on which timebases had been
+             * visited on the way here rather than on the current one: a device
+             * whose slowest rate is megahertz-class, such as DSO_E8-1 at 2 MHz,
+             * has a wide band of timebases in this case, and scrolling into it
+             * from 1 ms/div left a rate ten times higher than scrolling in from
+             * 10 ms/div. */
+            if (index < 0 && _sample_rate.count() > 0)
+                index = 0;
+
+            if (index >= 0)
+                _sample_rate.setCurrentIndex(index);
+
             commit_settings();
         }
 
@@ -425,8 +449,7 @@ namespace pv
                 g_variant_unref(gvar_list);
             }
 
-            _sample_rate.setMinimumWidth(_sample_rate.sizeHint().width() + 15);
-            _sample_rate.view()->setMinimumWidth(_sample_rate.sizeHint().width() + 30);
+            update_sample_rate_width();
 
             _sample_at->setText(_device_agent->is_external_clock() ? " @ ext." : " @ ");
 
@@ -548,7 +571,34 @@ namespace pv
             else if (rle_support)
                 duration = rle_depth / (samplerate * (1.0 / SR_SEC(1)));
             else
+            {
                 duration = hw_duration;
+
+                // DSO_E8-1 only: round the longest duration to a whole number
+                // in the unit it is shown in (131.072 ms -> 131 ms), rather
+                // than listing the raw hw_depth / samplerate.
+                //
+                // Restricted to this board, and to units below a second,
+                // because the rounding costs capture depth: the result seeds
+                // the decade walk that builds the whole list, and rounding
+                // down at second granularity would drop a DSLogic's top entry
+                // outright (1.678 s -> 1 s at 10 MHz on 16 channels). Below a
+                // second the loss is a fraction of a percent.
+                if (_device_agent->is_hardware_e8())
+                {
+                    double unit = SR_MS(1);
+                    while (unit > 1 && duration < unit)
+                        unit /= 1000;
+
+                    // Never round above hw_duration: anything longer would be
+                    // labelled RLE below and exceed the buffer.
+                    double rounded = round(duration / unit) * unit;
+                    if (rounded > hw_duration)
+                        rounded = floor(duration / unit) * unit;
+                    if (rounded > 0)
+                        duration = rounded;
+                }
+            }
 
             assert(duration > 0);
             bool not_last = true;
@@ -1321,7 +1371,37 @@ namespace pv
             font.setPointSizeF(AppConfig::Instance().appOptions.fontSize);
             ui::set_toolbar_font(this, font);
 
+            update_sample_rate_width();
             update_view_status();
+        }
+
+        void SamplingBar::update_sample_rate_width()
+        {
+            // Width only depends on the font, not on the current rate list, so
+            // the box keeps its size when the list is rebuilt (e.g. after the
+            // device options dialog).
+            QFontMetrics fm(_sample_rate.font());
+            int text_width = fm.horizontalAdvance("000 MHz");
+
+            for (int i = 0; i < _sample_rate.count(); i++)
+                text_width = std::max(text_width, fm.horizontalAdvance(_sample_rate.itemText(i)));
+
+            QStyleOptionComboBox opt;
+            opt.initFrom(&_sample_rate);
+            int width = _sample_rate.style()->sizeFromContents(QStyle::CT_ComboBox, &opt,
+                            QSize(text_width, fm.height()), &_sample_rate).width() + 15;
+
+            _sample_rate.setFixedWidth(width);
+            _sample_rate.view()->setMinimumWidth(width + 15);
+        }
+
+        bool SamplingBar::eventFilter(QObject *obj, QEvent *event)
+        {
+            if (obj == &_sample_rate
+                    && (event->type() == QEvent::Polish || event->type() == QEvent::StyleChange))
+                update_sample_rate_width();
+
+            return QToolBar::eventFilter(obj, event);
         }
 
         void SamplingBar::set_sample_count_index(int index)

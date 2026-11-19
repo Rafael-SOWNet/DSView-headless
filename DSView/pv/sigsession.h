@@ -196,6 +196,13 @@ public:
         return _trig_time;
     }
 
+    // Bumped on every DSO packet and never reset, so it tells apart the
+    // successive frames of one continuous run - which share a trigger time,
+    // a sample count and the snapshot object.
+    inline uint64_t get_dso_data_seq(){
+        return _dso_data_seq;
+    }
+
     inline bool is_triged(){
         return _is_triged;
     }
@@ -243,13 +250,17 @@ public:
     }
 
     // ---- Reference waveforms ------------------------------------------------
-    // A frozen copy of a DSO channel's samples, overlaid on the live view. It
-    // is rendered with the source channel's current vertical scaling (looked
-    // up by index at paint time) so it stays aligned to the grid.
+    // A frozen copy of a DSO channel's samples, overlaid on the live view.
+    // The raw codes only mean something together with the calibration they
+    // were captured at, so that is stored too: at paint time the codes are
+    // converted to millivolts and mapped onto the channel's *current* V/div
+    // and zero position, keeping the reference at its real amplitude.
     struct RefWave {
         int         index;          // source DSO channel index
         std::vector<uint8_t> samples;
         double      samplerate;
+        int         hw_offset;      // code for 0 V at capture time
+        double      mv_per_code;    // mV = (hw_offset - code) * mv_per_code
         QColor      colour;
         QString     name;
     };
@@ -398,6 +409,15 @@ public:
 
     inline void set_saving(bool flag){
         _is_saving = flag;
+    }
+
+    // Advanced trigger selected in the trigger dock; the per-channel trigger buttons are not in effect.
+    inline bool is_adv_trigger(){
+        return _is_adv_trigger;
+    }
+
+    inline void set_adv_trigger(bool flag){
+        _is_adv_trigger = flag;
     }
 
     inline DeviceEventObject* device_event_object(){
@@ -629,6 +649,7 @@ private:
     int         _repeat_hold_prg; // The time sleep progress
     int         _repeat_wait_prog_step;
     bool        _is_saving;
+    bool        _is_adv_trigger;
     bool        _is_instant;
     std::atomic<int>  _device_status;
     int         _work_time_id;
@@ -641,6 +662,7 @@ private:
 
     bool        _is_action;
     std::atomic<uint64_t>  _dso_packet_count;
+    std::atomic<uint64_t>  _dso_data_seq;
     bool        _is_task_end;
  
 

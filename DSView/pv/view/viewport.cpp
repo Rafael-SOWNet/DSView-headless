@@ -26,6 +26,7 @@
 
 #include "signal.h"
 #include "dsosignal.h"
+#include "dsldial.h"
 #include "logicsignal.h"
 #include "analogsignal.h"
 #include "spectrumtrace.h"
@@ -62,6 +63,8 @@ Viewport::Viewport(View &parent, View_type type) :
     _view(parent),
     _type(type),
     _need_update(false),
+    _persist_sig(0),
+    _persist_pending_ms(0),
     _sample_received(0),
     _action_type(NO_ACTION),
     _measure_type(NO_MEASURE),
@@ -159,6 +162,14 @@ bool Viewport::event(QEvent *event)
     return QWidget::event(event);
 }
 
+// Whether a logic channel's row reaches into a viewport of this height.
+// Channels scrolled out of view cost as much to paint as the visible ones.
+static bool logic_row_in_view(Trace *t, int height)
+{
+    const int half_height = t->get_totalHeight() / 2 + View::SignalMargin;
+    return t->get_y() + half_height >= 0 && t->get_y() - half_height <= height;
+}
+
 void Viewport::paintEvent(QPaintEvent *event)
 {
     (void)event;
@@ -196,6 +207,8 @@ void Viewport::doPaint()
     _view.get_traces(_type, traces);
 
     for(auto t : traces){
+        if (t->signal_type() == SR_CHANNEL_LOGIC && !logic_row_in_view(t, height()))
+            continue;
         t->paint_back(p, 0, _view.get_view_width(), fore, back);
         if (_view.back_ready())
             break;
@@ -345,6 +358,35 @@ void Viewport::paintYScaleBadge(QPainter &p, QColor fore, QColor back)
     _yscale_badge_rect = badge;
 }
 
+// Hash of everything that decides where a DSO frame lands in the viewport. A
+// change means the persistence ghosts no longer line up and must be dropped.
+quint64 Viewport::dso_persist_signature() const
+{
+    quint64 h = 1469598103934665603ULL;
+    auto mix = [&h](quint64 v) { h = (h ^ v) * 1099511628211ULL; };
+
+    // Horizontal scale/offset are excluded: ghosts get remapped on zoom/pan.
+    mix((quint64)_view.y_offset());
+    mix((quint64)_view.get_signalHeight());
+    mix((quint64)width() << 32 | (quint64)height());
+
+    std::vector<Trace*> traces;
+    _view.get_traces(_type, traces);
+    for (auto t : traces) {
+        mix(t->enabled());
+        mix(t->signal_type());
+        if (t->signal_type() == SR_CHANNEL_DSO) {
+            DsoSignal *dso = static_cast<DsoSignal*>(t);
+            mix(dso->get_vDialValue());
+            mix((quint64)dso->get_zero_vpos());
+            mix((quint64)dso->get_hw_offset());
+            mix((quint64)t->get_view_rect().top());
+            mix((quint64)t->get_view_rect().height());
+        }
+    }
+    return h;
+}
+
 void Viewport::paintSignals(QPainter &p, QColor fore, QColor back)
 {
     std::vector<Trace*> traces;
@@ -362,11 +404,15 @@ void Viewport::paintSignals(QPainter &p, QColor fore, QColor back)
                 {
                     LogicSignal *logic_signal = (LogicSignal*)t;
 
-                    if (bFirst)
+                    if (bFirst) {
                         end_align_sample = logic_signal->data()->get_ring_sample_count();
+                        bFirst = false;
+                    }
+
+                    if (!logic_row_in_view(t, height()))
+                        continue;
 
                     logic_signal->paint_mid_align_sample(p, 0, t->get_view_rect().right(), fore, back, end_align_sample);
-                    bFirst = false;
                 }
                 else{
                     t->paint_mid(p, 0, t->get_view_rect().right(), fore, back);
@@ -375,17 +421,78 @@ void Viewport::paintSignals(QPainter &p, QColor fore, QColor back)
         }
     }
     else {
+        // Render the cache at device resolution, preventing aliasing through
+        // integer upscaling on non-integer-scale displays.
+        const qreal dpr = devicePixelRatioF();
+        const QSize pixmap_size = size() * dpr;
+
         if (_view.scale() != _curScale ||
             _view.x_offset() != _curOffset ||
             _view.get_signalHeight() != _curSignalHeight ||
             _view.y_offset() != _curYOffset ||
+            _pixmap.size() != pixmap_size ||
+            _pixmap.devicePixelRatio() != dpr ||
             _need_update) {
             _curScale = _view.scale();
             _curOffset = _view.x_offset();
             _curSignalHeight = _view.get_signalHeight();
             _curYOffset = _view.y_offset();
 
-            _pixmap = QPixmap(size());
+            // Persistence: the frame being replaced becomes a fading ghost.
+            // Ghosts are dropped whenever the view or channel scaling changed.
+            const int persist_ms = AppConfig::Instance().appOptions.dsoPersistenceMs;
+            const quint64 persist_sig = dso_persist_signature();
+            if (persist_ms > 0 && _view.session().get_device()->get_work_mode() == DSO) {
+                if (persist_sig == _persist_sig && _persist_pixmap.size() == pixmap_size &&
+                    (_persist_scale != _view.scale() || _persist_x_offset != _view.x_offset())) {
+                    // Horizontal zoom/pan: remap the ghosts instead of dropping them.
+                    // Pixel x maps to (x + x_offset) * scale in sample units.
+                    const double k = _persist_scale / _view.scale();
+                    const double dx = ((double)_persist_x_offset * _persist_scale) / _view.scale()
+                                      - (double)_view.x_offset();
+                    QPixmap moved(pixmap_size);
+                    moved.setDevicePixelRatio(dpr);
+                    moved.fill(Qt::transparent);
+                    QPainter mp(&moved);
+                    mp.setRenderHint(QPainter::SmoothPixmapTransform, true);
+                    mp.translate(dx, 0);
+                    mp.scale(k, 1.0);
+                    mp.drawPixmap(0, 0, _persist_pixmap);
+                    mp.end();
+                    _persist_pixmap = moved;
+                }
+                if (persist_sig != _persist_sig || _persist_pixmap.size() != pixmap_size ||
+                    _persist_pixmap.devicePixelRatio() != dpr || _pixmap.isNull()) {
+                    _persist_pixmap = QPixmap(pixmap_size);
+                    _persist_pixmap.setDevicePixelRatio(dpr);
+                    _persist_pixmap.fill(Qt::transparent);
+                    _persist_pending_ms = 0;
+                }
+                else {
+                    // Fade in coarse steps: 8-bit alpha stalls on tiny per-frame factors.
+                    _persist_pending_ms += _persist_clock.isValid() ? _persist_clock.elapsed() : 0;
+                    const double factor = exp(-(double)_persist_pending_ms / persist_ms);
+                    QPainter gp(&_persist_pixmap);
+                    if (factor <= 0.92) {
+                        gp.setCompositionMode(QPainter::CompositionMode_DestinationIn);
+                        gp.fillRect(_persist_pixmap.rect(), QColor(0, 0, 0, qRound(factor * 255)));
+                        gp.setCompositionMode(QPainter::CompositionMode_SourceOver);
+                        _persist_pending_ms = 0;
+                    }
+                    gp.drawPixmap(0, 0, _pixmap);
+                }
+                _persist_sig = persist_sig;
+                _persist_scale = _view.scale();
+                _persist_x_offset = _view.x_offset();
+                _persist_clock.restart();
+            }
+            else if (!_persist_pixmap.isNull()) {
+                _persist_pixmap = QPixmap();
+                _persist_clock.invalidate();
+            }
+
+            _pixmap = QPixmap(pixmap_size);
+            _pixmap.setDevicePixelRatio(dpr);
             _pixmap.fill(Qt::transparent);
 
             QPainter dbp(&_pixmap);
@@ -415,6 +522,8 @@ void Viewport::paintSignals(QPainter &p, QColor fore, QColor back)
             }
             _need_update = false;
         }
+        if (!_persist_pixmap.isNull() && AppConfig::Instance().appOptions.dsoPersistenceMs > 0)
+            p.drawPixmap(0, 0, _persist_pixmap);
         p.drawPixmap(0, 0, _pixmap);
     }
 
@@ -593,9 +702,17 @@ void Viewport::paint_ref_waves(QPainter &p)
     if (vscale <= 0)
         return;
 
+    // Below this many pixels per sample the dash pattern gets eaten by the
+    // per-sample vertical zig-zag and the line turns into noise, so dense
+    // data is decimated to one min/max pair per pixel column and drawn solid.
+    const double DashMinPixelsPerSample = 3.0;
+
+    const QFontMetrics fm(p.font());
+    // Labels already drawn per source channel, so several references of the
+    // same channel stack instead of overprinting each other.
+    std::vector<int> label_rows;
+
     for (auto &rw : refs) {
-        // The reference is rendered with its source channel's current vertical
-        // scaling, so it tracks the channel's dial and stays on the grid.
         DsoSignal *sig = NULL;
         for (auto t : traces) {
             if (t->signal_type() == SR_CHANNEL_DSO && t->get_index() == rw.index) {
@@ -607,13 +724,22 @@ void Viewport::paint_ref_waves(QPainter &p)
             continue;
 
         const int64_t n = (int64_t)rw.samples.size();
-        if (n < 2 || rw.samplerate <= 0)
+        if (n < 2 || rw.samplerate <= 0 || rw.mv_per_code <= 0)
             continue;
 
-        const float zeroY = sig->get_zero_vpos();
-        const int hw_offset = sig->get_hw_offset();
-        const float sscale = sig->get_scale();
         const QRect vrect = sig->get_view_rect();
+        dslDial *vdial = sig->get_vDial();
+        if (vdial == NULL || vrect.height() <= 0)
+            continue;
+        const double mv_per_div = (double)vdial->get_value() * vdial->get_factor();
+        if (mv_per_div <= 0)
+            continue;
+
+        // Map the stored codes through their capture-time calibration onto
+        // the channel's current V/div: y = zeroY - mV * pixels_per_mV.
+        const double px_per_code =
+            rw.mv_per_code * vrect.height() / (DS_CONF_DSO_VDIVS * mv_per_div);
+        const float zeroY = sig->get_zero_vpos();
         const float top = vrect.top();
         const float bottom = vrect.bottom();
 
@@ -632,29 +758,91 @@ void Viewport::paint_ref_waves(QPainter &p)
             continue;
 
         const int64_t count = end_sample - start_sample + 1;
-        QPointF *points = new QPointF[count];
+        const bool dense = pixels_per_sample < DashMinPixelsPerSample;
+        // Dense data emits at most one min/max pair per pixel column.
+        const int64_t capacity = dense ? min(2 * count, 2 * (int64_t)width + 16)
+                                       : count;
+        // Reuse the scratch buffer across calls/waves instead of a fresh
+        // heap array every repaint - resize() only reallocates when growing
+        // past the buffer's current capacity.
+        if (_ref_wave_points.size() < capacity)
+            _ref_wave_points.resize(capacity);
+        QPointF *points = _ref_wave_points.data();
         QPointF *point = points;
+        const QPointF *const points_end = points + capacity;
         float x = (start_sample / samples_per_pixel - x_offset) + left
                   + trig_hoff * pixels_per_sample;
 
-        for (int64_t s = start_sample; s <= end_sample; s++) {
-            const uint8_t value = rw.samples[s];
-            const float y = min(max(top, zeroY + (value - hw_offset) * sscale), bottom);
-            *point++ = QPointF(x, y);
-            x += pixels_per_sample;
+        const auto code_to_y = [&](uint8_t code) {
+            const float y = zeroY + (code - rw.hw_offset) * px_per_code;
+            return min(max(top, y), bottom);
+        };
+
+        if (!dense) {
+            for (int64_t s = start_sample; s <= end_sample; s++) {
+                *point++ = QPointF(x, code_to_y(rw.samples[s]));
+                x += pixels_per_sample;
+            }
+        } else {
+            int col = 0;
+            bool have_col = false;
+            float ymin = 0, ymax = 0;
+            float last_y = 0;
+            bool have_last = false;
+
+            // Emit the column's extremes, nearest one first, so the polyline
+            // joins neighbouring columns without crossing diagonals.
+            const auto flush = [&]() {
+                if (!have_col || point + 2 > points_end)
+                    return;
+                float a = ymin, b = ymax;
+                if (have_last && fabs(last_y - b) < fabs(last_y - a))
+                    std::swap(a, b);
+                *point++ = QPointF(col, a);
+                if (b != a)
+                    *point++ = QPointF(col, b);
+                last_y = b;
+                have_last = true;
+            };
+
+            for (int64_t s = start_sample; s <= end_sample; s++) {
+                const float y = code_to_y(rw.samples[s]);
+                const int c = (int)floor(x);
+                if (!have_col || c != col) {
+                    flush();
+                    col = c;
+                    ymin = ymax = y;
+                    have_col = true;
+                } else {
+                    ymin = min(ymin, y);
+                    ymax = max(ymax, y);
+                }
+                x += pixels_per_sample;
+            }
+            flush();
         }
 
         QColor c = rw.colour;
-        c.setAlpha(180);
-        QPen pen(c);
-        pen.setStyle(Qt::DashLine);
+        c.setAlpha(130);     // 80% transparent
+        QPen pen(c, AppConfig::Instance().appOptions.dsoSignalLineWidth);
+        if (!dense) {
+            // Qt::DashLine is 4 on / 2 off, which reads as almost solid next
+            // to the live trace. Equal dash and gap instead; the pattern is in
+            // units of the pen width, so it keeps its look at any line width.
+            pen.setDashPattern({5, 5});
+        }
         p.setPen(pen);
         p.drawPolyline(points, point - points);
 
-        // Label the reference near its left end.
-        p.drawText(QPointF(left + 4, top + 12), rw.name);
-
-        delete[] points;
+        // Label the reference near its left end, one text row per reference
+        // already labelled on this channel.
+        if ((int)label_rows.size() <= rw.index)
+            label_rows.resize(rw.index + 1, 0);
+        const int row = label_rows[rw.index]++;
+        c.setAlpha(230);
+        p.setPen(QPen(c));
+        p.drawText(QPointF(left + 4, top + fm.ascent() + 2 + row * fm.height()),
+                   rw.name);
     }
 }
 
@@ -1847,23 +2035,28 @@ void Viewport::measure()
             }
             else if (s->signal_type() == SR_CHANNEL_DSO) {
                  view::DsoSignal *dsoSig = ( view::DsoSignal*)s;
-                if (s->enabled()) {
-                    if (_measure_en && dsoSig->measure(_view.hover_point())) {
-                        _measure_type = DSO_VALUE;
-                    }
-                    else {
-                        _measure_type = NO_MEASURE;
-                    }
+                // measure() must run even while the channel is disabled: it
+                // resets its own hover state (_hover_en = false) and returns
+                // false in that case. Gating the call itself on s->enabled()
+                // (as before) skipped that reset entirely, so a channel
+                // disabled after being hovered kept showing a stale row in
+                // the floating measurement panel forever.
+                //
+                // Only ever promote _measure_type to DSO_VALUE here, never
+                // reset it back to NO_MEASURE - it already starts each call
+                // at NO_MEASURE (set once above, before this loop), and with
+                // several DSO/analog channels in play, one channel failing
+                // to hover-match (e.g. because it's disabled, or the mouse
+                // is outside its row in split mode) must not clobber another
+                // channel's successful match from earlier in this same loop.
+                if (_measure_en && dsoSig->measure(_view.hover_point())) {
+                    _measure_type = DSO_VALUE;
                 }
             }
             else if (s->signal_type() == SR_CHANNEL_ANALOG) {
                 view::AnalogSignal *analogSig = (view::AnalogSignal*)s;
-                if (s->enabled()) {
-                    if (_measure_en && analogSig->measure(_view.hover_point())) {
-                        _measure_type = DSO_VALUE;
-                    } else {
-                        _measure_type = NO_MEASURE;
-                    }
+                if (_measure_en && analogSig->measure(_view.hover_point())) {
+                    _measure_type = DSO_VALUE;
                 }
             }
         }
@@ -2014,7 +2207,11 @@ void Viewport::paintMeasure(QPainter &p, QColor fore, QColor back)
             const double pad = 5.0 * sc;
             const double row_h = 20.0 * sc;
             const double width = _view.get_view_width() - _view.verticalScrollBar()->geometry().width();
-            const double height = _view.get_view_height() - _view.horizontalScrollBar()->geometry().height() - View::StatusHeight;
+            // Drawn in viewport coordinates, so clamp against this widget's
+            // own height less whatever the status bar covers. The old
+            // View::StatusHeight constant is the LOGIC height - in DSO the
+            // bar is 55px and the popup ended up behind it.
+            const double height = this->height() - _view.get_status_overlap();
             const double left = hoverpoint_x;
             const double top = hoverpoint_y;
             const double right = left + typical_width;
@@ -2068,6 +2265,10 @@ void Viewport::paintMeasure(QPainter &p, QColor fore, QColor back)
 
         struct MRow { QString name; QString val; QColor colour; };
         std::vector<MRow> rows;
+        bool have_hover_index = false;
+        uint64_t hover_sample_index = 0;
+        // Channels whose row the mouse is over; their references get a row too.
+        std::vector<int> hovered_channels;
 
         for(auto s : _view.session().get_signals()) {
             if (s->signal_type() == SR_CHANNEL_DSO) {
@@ -2086,6 +2287,12 @@ void Viewport::paintMeasure(QPainter &p, QColor fore, QColor back)
                     r.val = dsoSig->get_voltage(dsoSig->get_hw_offset() - value, 3);
                     r.colour = dsoSig->get_colour();
                     rows.push_back(r);
+                    hovered_channels.push_back(dsoSig->get_index());
+
+                    if (!have_hover_index) {
+                        hover_sample_index = index;
+                        have_hover_index = true;
+                    }
                 }
             }
             else if (s->signal_type() == SR_CHANNEL_ANALOG) {
@@ -2102,10 +2309,49 @@ void Viewport::paintMeasure(QPainter &p, QColor fore, QColor back)
             }
         }
 
+        // Saved reference waveforms of the hovered channels. The sample under
+        // the mouse is found by inverting paint_ref_waves()' x mapping, and the
+        // code converted with the reference's own capture-time calibration.
+        const double vscale = _view.scale();
+        if (!hovered_channels.empty() && vscale > 0) {
+            for (auto &rw : _view.session().get_ref_waves()) {
+                if (std::find(hovered_channels.begin(), hovered_channels.end(),
+                              rw.index) == hovered_channels.end())
+                    continue;
+                if (rw.samples.empty() || rw.samplerate <= 0)
+                    continue;
+
+                const double samples_per_pixel = rw.samplerate * vscale;
+                const double s = (hoverpoint_x + _view.x_offset()) * samples_per_pixel
+                                 - _view.trig_hoff();
+                const int64_t idx = (int64_t)floor(s + 0.5);
+                if (idx < 0 || idx >= (int64_t)rw.samples.size())
+                    continue;
+
+                const double mv = (rw.hw_offset - rw.samples[idx]) * rw.mv_per_code;
+                MRow r;
+                r.name = rw.name;
+                r.val = fabs(mv) >= 1000 ? QString::number(mv / 1000.0, 'f', 3) + "V"
+                                         : QString::number(mv, 'f', 3) + "mV";
+                r.colour = rw.colour;
+                rows.push_back(r);
+            }
+        }
+
         // Draw the hovered voltages in a single floating panel (like the
         // logic-mode measurement popup) instead of printing each number on
         // top of its trace, where it is hard to read.
         if (!rows.empty()) {
+            if (have_hover_index) {
+                MRow r;
+                r.name = L_S(STR_PAGE_DLG, S_ID(IDS_DLG_TIME), "Time");
+                r.val = _view.get_ruler()->format_real_time(
+                    hover_sample_index - _view.session().get_trigger_pos(),
+                    _view.session().cur_snap_samplerate());
+                r.colour = fore;
+                rows.insert(rows.begin(), r);
+            }
+
             // The floating panel is drawn 50% larger than the trace font and
             // in bold to keep the hovered values easy to read.
             const double sc = _view.get_trace_font_scale() * 1.2;
@@ -2115,7 +2361,13 @@ void Viewport::paintMeasure(QPainter &p, QColor fore, QColor back)
             measure_font.setPointSizeF(AppConfig::Instance().GetTraceFontSize() * sc);
             p.setFont(measure_font);
 
-            int name_w = 0, val_w = 0;
+            // Size the value column from a worst-case template rather than the
+            // actual strings, so the panel doesn't resize when a value's unit
+            // switches (e.g. V <-> mV) as the signal changes.
+            const QString val_w_template = "-999.000mV";
+
+            int name_w = 0, val_w = p.boundingRect(0, 0, INT_MAX, INT_MAX,
+                Qt::AlignLeft | Qt::AlignVCenter, val_w_template).width();
             for (auto &r : rows) {
                 name_w = max(name_w, p.boundingRect(0, 0, INT_MAX, INT_MAX,
                     Qt::AlignLeft | Qt::AlignVCenter, r.name).width());
@@ -2131,8 +2383,7 @@ void Viewport::paintMeasure(QPainter &p, QColor fore, QColor back)
 
             const double width = _view.get_view_width()
                 - _view.verticalScrollBar()->geometry().width();
-            const double vheight = _view.get_view_height()
-                - _view.horizontalScrollBar()->geometry().height() - View::StatusHeight;
+            const double vheight = this->height() - _view.get_status_overlap();
 
             // Offset from the cursor, flipping to stay inside the view.
             double bx = hoverpoint_x + MousePointerClearance;

@@ -48,7 +48,7 @@ DS1307_I2C_ADDRESS = 0x68
 
 def regs_and_bits():
     l = [('reg-' + r.lower(), r + ' register') for r in regs]
-    l += [('bit-' + re.sub('\/| ', '-', b).lower(), b + ' bit') for b in bits]
+    l += [('bit-' + re.sub(r'\/| ', '-', b).lower(), b + ' bit') for b in bits]
     return tuple(l)
 
 class Decoder(srd.Decoder):

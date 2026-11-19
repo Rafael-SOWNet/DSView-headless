@@ -36,13 +36,122 @@
 #include <QSizePolicy>
 #include <QRadioButton>
 #include <QButtonGroup>
+#include <QScrollArea>
+#include <QScrollBar>
+#include <QScreen>
+#include <QGuiApplication>
+#include <QWindow>
+#include <QStyle>
+#include <QEvent>
 
 #include "../config/appconfig.h"
 #include "../ui/langresource.h"
 #include "../appcontrol.h"
 #include "../sigsession.h"
 #include "../ui/dscombobox.h"
+#include "../ui/xspinbox.h"
 #include "../log.h"
+
+namespace
+{
+
+// A scroll area that asks for the full size of its content. A maximum
+// height then makes it scroll instead of growing.
+class ContentSizeScrollArea : public QScrollArea
+{
+public:
+    QSize sizeHint() const override
+    {
+        const int f = 2 * frameWidth();
+        QSize sz = widget()->sizeHint() + QSize(f, f);
+
+        if (sz.height() > maximumHeight()){
+            sz.rwidth() += verticalScrollBar()->sizeHint().width();
+        }
+        return sz;
+    }
+};
+
+// Makes the scroll area shorter when the dialog would be taller than the
+// free area of its screen, so that OK and Cancel stay reachable on small or
+// highly scaled screens. This runs on the dialog's show event: the layouts
+// are set up by then, and the dialog is centred on screen afterwards.
+class FitToScreenFilter : public QObject
+{
+public:
+    FitToScreenFilter(QScrollArea *scroll, QWidget *screenRef)
+        : _scroll(scroll), _screenRef(screenRef)
+    {
+    }
+
+    bool eventFilter(QObject *obj, QEvent *event) override
+    {
+        if (event->type() == QEvent::Show && obj->isWidgetType()){
+            fit(static_cast<QWidget*>(obj));
+        }
+        return QObject::eventFilter(obj, event);
+    }
+
+private:
+    void fit(QWidget *dlg)
+    {
+        // The main window's screen. Not QGuiApplication::screenAt(): global
+        // positions are unknown on Wayland.
+        QScreen *screen = NULL;
+        QWidget *top = _screenRef != NULL ? _screenRef->window() : NULL;
+        if (top != NULL && top->windowHandle() != NULL){
+            screen = top->windowHandle()->screen();
+        }
+        if (screen == NULL){
+            screen = QGuiApplication::primaryScreen();
+        }
+        if (screen == NULL){
+            return;
+        }
+
+        int avail = screen->availableGeometry().height();
+        if (!dlg->windowFlags().testFlag(Qt::FramelessWindowHint)){
+            // The native title bar is not part of the dialog's height.
+            avail -= dlg->style()->pixelMetric(QStyle::PM_TitleBarHeight, NULL, dlg);
+        }
+        relayout(dlg);
+        if (dlg->height() <= avail){
+            return;
+        }
+
+        const int other = dlg->height() - _scroll->height();
+        const int minHeight = 4 * _scroll->fontMetrics().height();
+        _scroll->setMaximumHeight(std::max(avail - other, minHeight));
+        relayout(dlg);
+    }
+
+    // Brings the sizes up to date. The dialog sets its fonts just before it
+    // is shown, and the layout requests that follow are only posted, so the
+    // layouts still have sizes from the old fonts here.
+    void relayout(QWidget *dlg)
+    {
+        if (_scroll->widget()->layout() != NULL){
+            _scroll->widget()->layout()->activate();
+        }
+        // The scroll area is not told when its content's size changes.
+        _scroll->updateGeometry();
+
+        for (QWidget *w = _scroll->parentWidget(); w != NULL; w = w->parentWidget()){
+            if (w->layout() != NULL){
+                w->layout()->activate();
+            }
+            if (w == dlg){
+                break;
+            }
+        }
+        dlg->adjustSize();
+    }
+
+    QScrollArea *_scroll;
+    QWidget     *_screenRef;
+};
+
+} // namespace
 
 namespace pv
 {
@@ -161,6 +270,20 @@ bool ApplicationParamDlg::ShowDlg(QWidget *parent)
     QComboBox *ftCbSize = new DsComboBox();
     ftCbSize->setFixedWidth(50);
     bind_font_size_list(ftCbSize, app.appOptions.fontSize);
+
+    // Toolbar icon size in px, 0 = the style's default.
+    QComboBox *cbIconSize = new DsComboBox();
+    cbIconSize->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    cbIconSize->addItem(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_ICON_SIZE_AUTO), "Automatic"), 0);
+    for (int size : {24, 32, 40, 48}){
+        cbIconSize->addItem(QString("%1 px").arg(size), size);
+    }
+    if (cbIconSize->findData(app.appOptions.toolbarIconSize) < 0){
+        // A size set in the config file by hand.
+        cbIconSize->addItem(QString("%1 px").arg(app.appOptions.toolbarIconSize),
+                            app.appOptions.toolbarIconSize);
+    }
+    cbIconSize->setCurrentIndex(cbIconSize->findData(app.appOptions.toolbarIconSize));
    
     QHBoxLayout *hl_units = new QHBoxLayout();
     QButtonGroup *bg_timeUnit = new QButtonGroup();
@@ -180,13 +303,28 @@ bool ApplicationParamDlg::ShowDlg(QWidget *parent)
     QCheckBox *ck_decoderDynamicFontWidth = new QCheckBox();
     ck_decoderDynamicFontWidth->setChecked(fontWidthEnabled);
 
-    QDoubleSpinBox *spinBox_lineWidth = new QDoubleSpinBox();
+    QDoubleSpinBox *spinBox_lineWidth = new XDoubleSpinBox();
     spinBox_lineWidth->setDecimals(1);
     spinBox_lineWidth->setSingleStep(0.5);
     spinBox_lineWidth->setMinimum(1.0);
     spinBox_lineWidth->setMaximum(4.0);
     spinBox_lineWidth->setValue(app.appOptions.logicSignalLineWidth);
     spinBox_lineWidth->setSuffix(" px");
+
+    QDoubleSpinBox *spinBox_dsoLineWidth = new QDoubleSpinBox();
+    spinBox_dsoLineWidth->setDecimals(1);
+    spinBox_dsoLineWidth->setSingleStep(0.5);
+    spinBox_dsoLineWidth->setMinimum(1.0);
+    spinBox_dsoLineWidth->setMaximum(4.0);
+    spinBox_dsoLineWidth->setValue(app.appOptions.dsoSignalLineWidth);
+    spinBox_dsoLineWidth->setSuffix(" px");
+
+    QSpinBox *spinBox_dsoPersistence = new XSpinBox();
+    spinBox_dsoPersistence->setRange(0, 10000);
+    spinBox_dsoPersistence->setSingleStep(100);
+    spinBox_dsoPersistence->setSpecialValueText(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_OFF), "Off"));
+    spinBox_dsoPersistence->setValue(app.appOptions.dsoPersistenceMs);
+    spinBox_dsoPersistence->setSuffix(" ms");
 
     // Logic group
     QGroupBox *logicGroup = new QGroupBox(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_GROUP_LOGIC), "Logic"));
@@ -209,13 +347,13 @@ bool ApplicationParamDlg::ShowDlg(QWidget *parent)
     slider_maxFontWidth->setTickPosition(QSlider::TicksBelow);
     slider_maxFontWidth->setFixedWidth(250);
     slider_maxFontWidth->setEnabled(fontWidthEnabled);
-    QSpinBox *spinBox_minFontWidth = new QSpinBox();
+    QSpinBox *spinBox_minFontWidth = new XSpinBox();
     spinBox_minFontWidth->setMinimum(DecoderFontStretchMinimum);
     spinBox_minFontWidth->setMaximum(DecoderFontStretchMaximum);
     spinBox_minFontWidth->setValue(app.appOptions.minDecoderFontWidthPercent);
     spinBox_minFontWidth->setSuffix("%");
     spinBox_minFontWidth->setEnabled(fontWidthEnabled);
-    QSpinBox *spinBox_maxFontWidth = new QSpinBox();
+    QSpinBox *spinBox_maxFontWidth = new XSpinBox();
     spinBox_maxFontWidth->setMinimum(DecoderFontStretchMinimum);
     spinBox_maxFontWidth->setMaximum(DecoderFontStretchMaximum);
     spinBox_maxFontWidth->setValue(app.appOptions.maxDecoderFontWidthPercent);
@@ -329,29 +467,48 @@ bool ApplicationParamDlg::ShowDlg(QWidget *parent)
     QGroupBox *dsoGroup = new QGroupBox(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_GROUP_DSO), "Scope"));
     QGridLayout *dsoLay = new QGridLayout();
     dsoLay->setContentsMargins(10,15,15,10);
-    dsoLay->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    dsoLay->setAlignment(Qt::AlignTop);
+    dsoLay->setColumnStretch(0, 1);
     dsoGroup->setLayout(dsoLay);
     dsoLay->addWidget(new QLabel(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_TRIG_DISPLAY_MIDDLE), "Tig pos in middle")), 0, 0, Qt::AlignLeft);
     dsoLay->addWidget(ck_trigInMid, 0, 1, Qt::AlignRight);
+    dsoLay->addWidget(new QLabel(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_SIGNAL_LINE_WIDTH), "Signal line width")), 1, 0, Qt::AlignLeft);
+    dsoLay->addWidget(spinBox_dsoLineWidth, 1, 1, Qt::AlignRight);
+    dsoLay->addWidget(new QLabel(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_DSO_PERSISTENCE), "Persistence (fade-out time)")), 2, 0, Qt::AlignLeft);
+    dsoLay->addWidget(spinBox_dsoPersistence, 2, 1, Qt::AlignRight);
     lay->addWidget(dsoGroup);
 
     //UI
     QGroupBox *uiGroup = new QGroupBox(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_GROUP_UI), "UI"));
     QGridLayout *uiLay = new QGridLayout();
     uiLay->setContentsMargins(10,15,15,10);
-    uiLay->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    uiLay->setAlignment(Qt::AlignTop);
+    uiLay->setColumnStretch(0, 1);
     uiGroup->setLayout(uiLay);
     uiLay->addWidget(new QLabel(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_DISPLAY_PROFILE_IN_BAR), "Profile in bar")), 0, 0, Qt::AlignLeft);
     uiLay->addWidget(ck_profileBar, 0, 1, Qt::AlignRight);
     uiLay->addWidget(new QLabel(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_FONT_SIZE), "Font size")), 1, 0, Qt::AlignLeft);
     uiLay->addWidget(ftCbSize, 1, 1, Qt::AlignRight);
-    uiLay->addWidget(new QLabel(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_DISPLAY_ANTIALIAS), "Antialiasing")), 2, 0, Qt::AlignLeft);
-    uiLay->addWidget(ck_antialias, 2, 1, Qt::AlignRight);
-    uiLay->addWidget(new QLabel(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_DONT_ASK_SAVE_ON_EXIT), "Do not ask to save captured data")), 3, 0, Qt::AlignLeft);
-    uiLay->addWidget(ck_dontAskSaveOnExit, 3, 1, Qt::AlignRight);
+    uiLay->addWidget(new QLabel(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_TOOLBAR_ICON_SIZE), "Toolbar icon size")), 2, 0, Qt::AlignLeft);
+    uiLay->addWidget(cbIconSize, 2, 1, Qt::AlignRight);
+    uiLay->addWidget(new QLabel(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_DISPLAY_ANTIALIAS), "Antialiasing")), 3, 0, Qt::AlignLeft);
+    uiLay->addWidget(ck_antialias, 3, 1, Qt::AlignRight);
+    uiLay->addWidget(new QLabel(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_DONT_ASK_SAVE_ON_EXIT), "Do not ask to save captured data")), 4, 0, Qt::AlignLeft);
+    uiLay->addWidget(ck_dontAskSaveOnExit, 4, 1, Qt::AlignRight);
     lay->addWidget(uiGroup);
 
-    dlg.layout()->addLayout(lay);      
+    // The groups scroll when the dialog would not fit on the screen.
+    QWidget *content = new QWidget();
+    content->setLayout(lay);
+    ContentSizeScrollArea *scroll = new ContentSizeScrollArea();
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll->setWidgetResizable(true);
+    scroll->setWidget(content);
+    FitToScreenFilter fitFilter(scroll, parent);
+    dlg.installEventFilter(&fitFilter);
+
+    dlg.layout()->addWidget(scroll);
     dlg.layout()->setSizeConstraint(QLayout::SetFixedSize);
     // prevent dlg.exec()'s implicit font update from resetting preview font stretches
     label_minSample->setObjectName("__LOCKED_FONT_MINSAMPLE");
@@ -385,6 +542,10 @@ bool ApplicationParamDlg::ShowDlg(QWidget *parent)
         if (app.appOptions.fontSize != fSize){
             app.appOptions.fontSize = fSize;
             bFontChanged = true;
+        }
+        if (app.appOptions.toolbarIconSize != cbIconSize->currentData().toInt()){
+            app.appOptions.toolbarIconSize = cbIconSize->currentData().toInt();
+            bAppChanged = true;
         }
         if (app.appOptions.autoScrollLatestData != ck_autoScrollLatestData->isChecked()){
             app.appOptions.autoScrollLatestData = ck_autoScrollLatestData->isChecked();
@@ -420,6 +581,14 @@ bool ApplicationParamDlg::ShowDlg(QWidget *parent)
         }
         if (app.appOptions.logicSignalLineWidth != spinBox_lineWidth->value()) {
             app.appOptions.logicSignalLineWidth = spinBox_lineWidth->value();
+            bAppChanged = true;
+        }
+        if (app.appOptions.dsoSignalLineWidth != spinBox_dsoLineWidth->value()) {
+            app.appOptions.dsoSignalLineWidth = spinBox_dsoLineWidth->value();
+            bAppChanged = true;
+        }
+        if (app.appOptions.dsoPersistenceMs != spinBox_dsoPersistence->value()) {
+            app.appOptions.dsoPersistenceMs = spinBox_dsoPersistence->value();
             bAppChanged = true;
         }
         if (app.appOptions.logicChannelDivider != ck_channelDivider->isChecked()) {

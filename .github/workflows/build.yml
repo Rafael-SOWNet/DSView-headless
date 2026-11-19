@@ -15,6 +15,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Read version
+        run: |
+          # From CMakeLists.txt, for the file names below.
+          major="$(sed -nE 's/^set\(DS_VERSION_MAJOR ([0-9]+)\)/\1/p' CMakeLists.txt)"
+          minor="$(sed -nE 's/^set\(DS_VERSION_MINOR ([0-9]+)\)/\1/p' CMakeLists.txt)"
+          micro="$(sed -nE 's/^set\(DS_VERSION_MICRO ([0-9]+)\)/\1/p' CMakeLists.txt)"
+          echo "DSVIEW_VERSION=${major}.${minor}.${micro}" >> "$GITHUB_ENV"
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -22,7 +30,7 @@ jobs:
             build-essential cmake git pkg-config \
             qt6-base-dev libqt6svg6-dev libgl1-mesa-dev libxkbcommon-dev libvulkan-dev \
             libglib2.0-dev zlib1g-dev libusb-1.0-0-dev libboost-dev libfftw3-dev \
-            python3-dev libudev-dev dpkg-dev rsync patchelf
+            python3-dev libudev-dev dpkg-dev rsync patchelf appstream
 
       - name: Configure
         run: |
@@ -91,43 +99,66 @@ jobs:
           echo "--- ldd after patch ---"
           ldd "${BIN}.bin" 2>/dev/null || true
 
-          dpkg-deb --root-owner-group -b deb-extract "$DEB"
+          rm "$DEB"
+          dpkg-deb --root-owner-group -b deb-extract "DSView-${DSVIEW_VERSION}-linux-amd64.deb"
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v6
         with:
-          name: DSView-linux-deb
-          path: build/*.deb
+          name: DSView-${{ env.DSVIEW_VERSION }}-linux-amd64.deb
+          path: build/DSView-${{ env.DSVIEW_VERSION }}-linux-amd64.deb
 
       - name: Install into AppDir
         run: |
           rm -rf AppDir
           DESTDIR="${GITHUB_WORKSPACE}/AppDir" cmake --install build
 
-      - name: Download linuxdeployqt
+      - name: Download linuxdeploy
         run: |
-          wget -q -O linuxdeployqt \
-            "https://github.com/probonopd/linuxdeployqt/releases/download/continuous/linuxdeployqt-continuous-x86_64.AppImage"
-          chmod +x linuxdeployqt
+          # linuxdeployqt (previously used here) has a regression in its
+          # current "continuous" build: run against DSView's .desktop file, it
+          # silently omits libQt6*.so from the bundle entirely (confirmed by
+          # rebuilding this exact sequence locally and inspecting the result -
+          # it parses Qt6Widgets/Qt6Gui/Qt6Core as dependencies via its own
+          # logging, but never copies them). The resulting "AppImage" only
+          # happened to run on machines that already had system Qt6 installed,
+          # which is indistinguishable from a working build unless tested on a
+          # clean system - reported as "AppImage doesn't run without Qt6
+          # pre-installed". linuxdeploy + linuxdeploy-plugin-qt (actively
+          # maintained, purpose-built for Qt) does not share this bug - this
+          # was verified locally: a completely clean environment (env -i, no
+          # inherited LD_LIBRARY_PATH/QT_PLUGIN_PATH) successfully launched the
+          # resulting AppImage.
+          wget -q -O linuxdeploy \
+            "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
+          wget -q -O linuxdeploy-plugin-qt \
+            "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage"
+          chmod +x linuxdeploy linuxdeploy-plugin-qt
 
       - name: Build AppImage
         run: |
           export QMAKE="$(which qmake6)"
+          # linuxdeploy finds the "qt" plugin (linuxdeploy-plugin-qt) by
+          # searching PATH for a linuxdeploy-plugin-qt executable.
+          export PATH="${GITHUB_WORKSPACE}:${PATH}"
+
           # Deploy Qt/shared-lib dependencies into AppDir, but don't build the
           # final .AppImage yet - we still need to bundle the Python stdlib
-          # (DSView embeds Python for its protocol decoders, and linuxdeployqt
-          # only picks up libpython*.so via ldd, not the stdlib data files it
-          # loads at runtime, e.g. the `encodings` module).
-          ./linuxdeployqt --appimage-extract-and-run \
-            "${GITHUB_WORKSPACE}/AppDir/usr/share/applications/dsview.desktop" \
-            -qmake="${QMAKE}"
+          # (DSView embeds Python for its protocol decoders; the interpreter
+          # needs the stdlib data files it loads at runtime, e.g. the
+          # `encodings` module, which no Qt-focused deploy tool knows about).
+          ./linuxdeploy --appdir "${GITHUB_WORKSPACE}/AppDir" --plugin qt
 
-          # linuxdeployqt doesn't reliably pick up libpython*.so (it isn't a
-          # direct Qt dependency), so make sure it's actually in AppDir/usr/lib
-          # by copying whatever the just-installed binary is linked against.
-          ldd "${GITHUB_WORKSPACE}/AppDir/usr/bin/DSView" \
-            | awk '/libpython/ {print $3}' \
-            | xargs -r -I{} cp -Lv {} "${GITHUB_WORKSPACE}/AppDir/usr/lib/"
+          # Belt-and-suspenders: linuxdeploy-plugin-qt's own dependency scan
+          # already bundles libpython*.so (verified locally), but guard with
+          # an existence check rather than assume it always will - a plain
+          # `cp` would fail the step (source/dest resolving to the same file
+          # exits non-zero, and this workflow's steps run with `bash -e`) if
+          # it's already there.
+          PYSO="$(ldd "${GITHUB_WORKSPACE}/AppDir/usr/bin/DSView" | awk '/libpython/ {print $3}')"
+          if [ -n "${PYSO}" ] && [ ! -e "${GITHUB_WORKSPACE}/AppDir/usr/lib/$(basename "${PYSO}")" ]; then
+            cp -Lv "${PYSO}" "${GITHUB_WORKSPACE}/AppDir/usr/lib/"
+          fi
 
           PYVER="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
           PYLIBDIR="/usr/lib/python${PYVER}"
@@ -137,10 +168,14 @@ jobs:
             --exclude 'test' --exclude 'idlelib' --exclude 'tkinter' --exclude '__pycache__' \
             "${PYLIBDIR}/" "${DEST}/"
 
-          # linuxdeployqt's AppRun only sets up the Qt/library environment.
-          # Wrap it with our own AppRun that also points the bundled Python
-          # interpreter at the bundled stdlib, instead of falling back to
-          # whatever python3 (and version) happens to be on the host.
+          # linuxdeploy's AppRun (a plain symlink to the binary for Qt6 apps -
+          # it relies on the $ORIGIN rpaths the qt plugin already set on every
+          # bundled library, not an LD_LIBRARY_PATH-setting script) only
+          # covers Qt/library resolution. Wrap it with our own AppRun that
+          # also points the bundled Python interpreter at the bundled stdlib,
+          # instead of falling back to whatever python3 (and version) happens
+          # to be on the host. exec transparently follows the AppRun.qt
+          # symlink, so this works the same regardless of what form it takes.
           mv "${GITHUB_WORKSPACE}/AppDir/AppRun" "${GITHUB_WORKSPACE}/AppDir/AppRun.qt"
           cat > "${GITHUB_WORKSPACE}/AppDir/AppRun" <<EOF
           #!/bin/bash
@@ -151,17 +186,23 @@ jobs:
           EOF
           chmod +x "${GITHUB_WORKSPACE}/AppDir/AppRun"
 
+          # appimagetool makes .DirIcon from <Icon>.png at the AppDir root and
+          # can't use the SVG that linuxdeploy puts there.
+          rm -f "${GITHUB_WORKSPACE}/AppDir/dsview.png"
+          cp "${GITHUB_WORKSPACE}/AppDir/usr/share/icons/hicolor/256x256/apps/dsview.png" \
+            "${GITHUB_WORKSPACE}/AppDir/dsview.png"
+
           wget -q -O appimagetool \
             "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
           chmod +x appimagetool
           ./appimagetool --appimage-extract-and-run \
-            "${GITHUB_WORKSPACE}/AppDir" DSView-x86_64.AppImage
+            "${GITHUB_WORKSPACE}/AppDir" "DSView-${DSVIEW_VERSION}-x86_64.AppImage"
 
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@v6
         with:
-          name: DSView-linux-appimage
-          path: '*.AppImage'
+          name: DSView-${{ env.DSVIEW_VERSION }}-x86_64.AppImage
+          path: DSView-${{ env.DSVIEW_VERSION }}-x86_64.AppImage
 
   windows:
     name: Windows (MSYS2)
@@ -176,30 +217,51 @@ jobs:
       - name: Set up MSYS2
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
             git
             zip
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-qt6-base
-            mingw-w64-x86_64-qt6-svg
-            mingw-w64-x86_64-qt6-5compat
-            mingw-w64-x86_64-glib2
-            mingw-w64-x86_64-zlib
-            mingw-w64-x86_64-libusb
-            mingw-w64-x86_64-boost
-            mingw-w64-x86_64-fftw
-            mingw-w64-x86_64-python
-            mingw-w64-x86_64-pkg-config
+            rsync
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-qt6-base
+            mingw-w64-ucrt-x86_64-qt6-svg
+            mingw-w64-ucrt-x86_64-qt6-5compat
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-libusb
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-fftw
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-pkg-config
+
+      - name: Read version
+        run: |
+          # From CMakeLists.txt, for the file names below.
+          major="$(sed -nE 's/^set\(DS_VERSION_MAJOR ([0-9]+)\)/\1/p' CMakeLists.txt)"
+          minor="$(sed -nE 's/^set\(DS_VERSION_MINOR ([0-9]+)\)/\1/p' CMakeLists.txt)"
+          micro="$(sed -nE 's/^set\(DS_VERSION_MICRO ([0-9]+)\)/\1/p' CMakeLists.txt)"
+          echo "DSVIEW_VERSION=${major}.${minor}.${micro}" >> "$GITHUB_ENV"
 
       - name: Configure
         run: |
+          # Force CMake to find MSYS2's own ucrt64 Python (whose runtime DLL
+          # we actually bundle below) instead of the native Windows Python
+          # that's preinstalled on the windows-latest runner (e.g. python314.dll
+          # under the hosted tool cache). If CMake picks that one up instead,
+          # DSView.exe ends up linked against a DLL that only exists on the CI
+          # runner, isn't found by the /ucrt64/bin-only dependency bundling
+          # loop, and the packaged app fails to start with "python314.dll was
+          # not found".
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=dsview-dist
+            -DCMAKE_INSTALL_PREFIX=dsview-dist \
+            -DPython3_ROOT_DIR=/ucrt64 \
+            -DPython3_FIND_STRATEGY=LOCATION \
+            -DPython3_FIND_REGISTRY=NEVER \
+            -DPython3_FIND_VIRTUALENV=STANDARD
 
       - name: Build
         run: cmake --build build -j "$(nproc)"
@@ -218,22 +280,37 @@ jobs:
           # directly by DSView.exe itself).
           for group in platforms styles imageformats iconengines; do
             mkdir -p "dsview-dist/${group}"
-            cp -v /mingw64/share/qt6/plugins/${group}/*.dll "dsview-dist/${group}/"
+            cp -v /ucrt64/share/qt6/plugins/${group}/*.dll "dsview-dist/${group}/"
           done
+
+          # DSView embeds Python (for its protocol decoders) via
+          # Py_InitializeEx(); without its own copy of the standard library
+          # (encodings, os.py, etc.) next to the exe, the interpreter can't
+          # bootstrap once libpython3.14.dll is copied out of MSYS2's
+          # /ucrt64 prefix layout, and Py_FatalError() aborts the process
+          # silently before any window is shown. Bundle it under "pylib",
+          # which appcontrol.cpp points PYTHONHOME at via applicationDirPath().
+          PYVER="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+          mkdir -p "dsview-dist/pylib"
+          rsync -a \
+            --exclude 'test' --exclude 'idlelib' --exclude 'tkinter' --exclude '_tkinter*' \
+            --exclude '__pycache__' \
+            "/ucrt64/lib/python${PYVER}/" "dsview-dist/pylib/"
 
           # The install rules only place DSView.exe + data files; the MSYS2
           # toolchain/Qt6 runtime DLLs it's dynamically linked against still
-          # need to be copied in manually. Resolve the dependency closure with
-          # ldd and keep looping until a pass copies nothing new, since some
-          # transitive deps only show up once their dependents are present.
+          # need to be copied in manually. Resolve the dependency closure from
+          # the PE import tables and keep looping until a pass copies nothing
+          # new, since some transitive deps only show up once their dependents
+          # are present. objdump rather than ldd, which does not read the .pyd
+          # Python extension modules: they need DLLs of their own (libffi for
+          # ctypes, libmpdec for decimal, ...).
           while :; do
             new=0
-            for dll in $(find dsview-dist -name '*.exe' -o -name '*.dll' \
-                | xargs ldd 2>/dev/null \
-                | grep -i '/mingw64/bin/' | awk '{print $3}' | sort -u); do
-              base="$(basename "$dll")"
-              if [ ! -f "dsview-dist/$base" ]; then
-                cp -v "$dll" dsview-dist/
+            for dll in $(find dsview-dist \( -name '*.exe' -o -name '*.dll' -o -name '*.pyd' \) \
+                -exec objdump -p {} + | awk '/DLL Name:/ {print $3}' | sort -u); do
+              if [ -f "/ucrt64/bin/$dll" ] && [ ! -f "dsview-dist/$dll" ]; then
+                cp -v "/ucrt64/bin/$dll" dsview-dist/
                 new=1
               fi
             done
@@ -243,13 +320,34 @@ jobs:
       - name: Package as zip
         run: |
           cd dsview-dist
-          zip -r "${GITHUB_WORKSPACE}/DSView-windows-x86_64.zip" .
+          zip -r "${GITHUB_WORKSPACE}/DSView-${DSVIEW_VERSION}-windows-x86_64.zip" .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: DSView-windows
-          path: DSView-windows-x86_64.zip
+          name: DSView-${{ env.DSVIEW_VERSION }}-windows-x86_64.zip
+          path: DSView-${{ env.DSVIEW_VERSION }}-windows-x86_64.zip
+
+      # Native Windows shell rather than the job-default MSYS2 bash for the
+      # Inno Setup steps below: iscc.exe/pnputil.exe are plain Windows tools,
+      # and MSYS2 bash's automatic POSIX<->Windows path conversion is an
+      # unnecessary complication for invoking them.
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          # The version comes from CMakeLists.txt (see "Read version"), so the
+          # installer's version can't drift from the one DSView itself reports.
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer\windows\dsview.iss" "/DMyAppVersion=$env:DSVIEW_VERSION"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: DSView-${{ env.DSVIEW_VERSION }}-windows-x86_64-setup.exe
+          path: installer/windows/Output/DSView-${{ env.DSVIEW_VERSION }}-windows-x86_64-setup.exe
 
   release:
     name: Publish latest pre-release
@@ -259,6 +357,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Only CMakeLists.txt is needed, to read the app version for the title.
+      - name: Checkout CMakeLists.txt
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: CMakeLists.txt
+          sparse-checkout-cone-mode: false
+
       - name: Download artifacts
         uses: actions/download-artifact@v7
         with:
@@ -269,10 +374,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          major="$(sed -nE 's/^set\(DS_VERSION_MAJOR ([0-9]+)\)/\1/p' CMakeLists.txt)"
+          minor="$(sed -nE 's/^set\(DS_VERSION_MINOR ([0-9]+)\)/\1/p' CMakeLists.txt)"
+          micro="$(sed -nE 's/^set\(DS_VERSION_MICRO ([0-9]+)\)/\1/p' CMakeLists.txt)"
+          version="${major}.${minor}.${micro}-dev"
           gh release delete latest --yes --cleanup-tag --repo "${GITHUB_REPOSITORY}" || true
           gh release create latest artifacts/* \
             --repo "${GITHUB_REPOSITORY}" \
-            --title "Latest build" \
+            --title "Latest build ${version}" \
             --notes "Automated build from commit ${GITHUB_SHA}" \
             --prerelease \
             --target "${GITHUB_SHA}"

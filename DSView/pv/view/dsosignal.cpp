@@ -29,10 +29,12 @@
 #include "view.h"
 #include "../dsvdef.h"
 #include "../data/dsosnapshot.h"
-#include "../sigsession.h" 
+#include "../data/dsoedgedetect.h"
+#include "../sigsession.h"
 #include "../log.h"
 #include "../appcontrol.h"
 #include "../ui/langresource.h"
+#include "../config/appconfig.h"
  
 using namespace std;
 
@@ -76,6 +78,11 @@ DsoSignal::DsoSignal(data::DsoSnapshot *data,
     _vDialActive = false;
     _mValid = false;
     _level_valid = false;
+    _soft_measure_logged = false;
+    _soft_measure_cache_valid = false;
+    _soft_measure_cache_data = NULL;
+    _soft_measure_cache_sample_count = 0;
+    _soft_measure_cache_seq = 0;
     _autoV = false;
     _autoH = false;
     _autoV_over = false;
@@ -198,6 +205,7 @@ bool DsoSignal::go_vDialPre(bool manul)
         }
         session->get_device()->set_config_uint16(SR_CONF_PROBE_OFFSET,
                               _zero_offset, _probe, NULL);
+        _data->set_measure_voltage_factor(_vDial->get_value(), get_index());
 
         _view->vDial_updated();
         _view->set_update(_viewport, true);
@@ -214,7 +222,7 @@ bool DsoSignal::go_vDialPre(bool manul)
 bool DsoSignal::go_vDialNext(bool manul)
 {
     if (_autoV && manul)
-        autoV_end(); 
+        autoV_end();
 
     if (enabled() && !_vDial->isMax())
     {
@@ -233,6 +241,7 @@ bool DsoSignal::go_vDialNext(bool manul)
         }
         session->get_device()->set_config_uint16(SR_CONF_PROBE_OFFSET,
                               _zero_offset, _probe, NULL);
+        _data->set_measure_voltage_factor(_vDial->get_value(), get_index());
 
         _view->vDial_updated();
         _view->set_update(_viewport, true);
@@ -244,6 +253,35 @@ bool DsoSignal::go_vDialNext(bool manul)
             autoV_end();
         return false;
     }
+}
+
+// MSO-E8: its V/div list holds a single fixed range, so the dial has nothing
+// to step. The real gain control is the input attenuator behind the
+// x1/x10/x100 probe-factor buttons (e8_set_attenuator() in dscope.c), which
+// auto-set steps instead. dir > 0 means more attenuation.
+bool DsoSignal::go_attenStep(int dir)
+{
+    static const uint64_t factors[] = {1, 10, 100};
+    const int count = countof(factors);
+    const uint64_t cur = get_factor();
+
+    int i = 0;
+    while (i < count - 1 && factors[i] < cur)
+        i++;
+    const int next = i + (dir > 0 ? 1 : -1);
+
+    if (!enabled() || next < 0 || next >= count) {
+        if (_autoV && !_autoV_over)
+            autoV_end();
+        return false;
+    }
+
+    if (session->is_running_status())
+        session->refresh(RefreshShort);
+
+    set_factor(factors[next]);
+    _view->dso_factor_updated();
+    return true;
 }
 
 bool DsoSignal::load_settings()
@@ -650,9 +688,16 @@ QRect DsoSignal::get_view_rect()
                       height);
     }
 
+    // The measurement bar floats over the bottom of the viewport and paints
+    // over it, so the grid has to stop above it - otherwise the lowest
+    // divisions are simply not visible, and because the volts/div mapping is
+    // derived from this height the waveform is scaled to an area larger than
+    // the one on screen.
+    const int covered = _view ? _view->get_status_overlap() : 0;
+
     return QRect(0, UpMargin,
                   _viewport->width() - RightMargin,
-                  _viewport->height() - UpMargin - DownMargin);
+                  max(_viewport->height() - UpMargin - DownMargin - covered, 1));
 }
 
 void DsoSignal::paint_prepare()
@@ -839,10 +884,25 @@ void DsoSignal::paint_mid(QPainter &p, int left, int right, QColor fore, QColor 
         }
 
         sr_status status;
-        
-        if (session->dso_status_is_valid()) {
-            _mValid = true;
+        memset(&status, 0, sizeof(status));
+
+        // Whether the device gave us a usable status block at all. A device
+        // whose firmware never fills one (or whose status read failed for
+        // this frame) leaves this FALSE - the waveform still draws, since
+        // that comes from the streamed samples, but every hardware-derived
+        // measurement below is absent. The software fallback further down
+        // must therefore run OUTSIDE this branch, or such a device can never
+        // produce a single measurement and the whole status bar reads "--".
+        const bool hw_status_valid = session->dso_status_is_valid();
+
+        if (hw_status_valid) {
             status = session->get_dso_status();
+        }
+
+        const bool hw_measure_valid = hw_status_valid && status.measure_valid;
+
+        if (hw_status_valid) {
+            _mValid = true;
 
             if (status.measure_valid) {
                 _min = (index == 0) ? status.ch0_min : status.ch1_min;
@@ -886,12 +946,47 @@ void DsoSignal::paint_mid(QPainter &p, int left, int right, QColor fore, QColor 
                 _mean = (index == 0) ? status.ch0_acc_mean : status.ch1_acc_mean;
                 _mean = hw_offset - _mean / _data->get_sample_count();
             }
+        }
 
-            // The hardware frequently returns no cycle data for the 2nd
-            // channel even on a valid signal, so its period/frequency/duty/
-            // count/width read "--". Fall back to a software measurement.
-            if (!_level_valid || _period == 0)
-                compute_soft_measure(hw_offset);
+        // The hardware's own cycle/level measurement engine can fail to
+        // evaluate a channel correctly - most commonly because that channel's
+        // trigger is misconfigured (the trigger comparator and the
+        // auto-measurement level detection share the same hardware path) -
+        // and some devices report no status block at all. The displayed
+        // waveform is unaffected either way, since it is just the raw
+        // streamed samples, so fall back to a software measurement derived
+        // from those samples.
+        if (!hw_measure_valid || !_level_valid || _period == 0) {
+            if (!_soft_measure_logged) {
+                // Log the raw hardware fields behind the fallback decision
+                // (not just the fact of it), so it is possible to tell
+                // whether the device genuinely found no valid cycle
+                // (count/levels read 0), reports invalid despite having
+                // usable-looking counters, or produced no status at all.
+                const uint32_t count = (index == 0) ? status.ch0_cyc_cnt : status.ch1_cyc_cnt;
+                const uint32_t tlen = (index == 0) ? status.ch0_cyc_tlen : status.ch1_cyc_tlen;
+                const uint8_t lvl_high = (index == 0) ? status.ch0_high_level : status.ch1_high_level;
+                const uint8_t lvl_low = (index == 0) ? status.ch0_low_level : status.ch1_low_level;
+                dsv_info("DsoSignal: channel %d has no valid hardware cycle "
+                          "measurement (status_valid=%d, measure_valid=%d, "
+                          "level_valid=%d, cyc_cnt=%u, cyc_tlen=%u, "
+                          "high_level=%u, low_level=%u, max=%u, min=%u), using "
+                          "software fallback. If the device reports a status "
+                          "block at all, this channel's trigger is probably "
+                          "set wrong (the hardware measurement engine shares "
+                          "the trigger comparator, so a misconfigured trigger "
+                          "can break measurement without affecting the "
+                          "displayed waveform).",
+                          index, hw_status_valid, hw_measure_valid,
+                          _level_valid, count, tlen,
+                          lvl_high, lvl_low, _max, _min);
+                _soft_measure_logged = true;
+            }
+            compute_soft_measure(hw_offset);
+        }
+        else {
+            // Hardware recovered: log again if it drops out later.
+            _soft_measure_logged = false;
         }
     }
 }
@@ -903,8 +998,11 @@ void DsoSignal::paint_fore(QPainter &p, int left, int right, QColor fore, QColor
 
     assert(_view); 
 
-    fore.setAlpha(View::BackAlpha);
-    QPen pen(fore);
+    // Use the channel's own colour (not the grid's fore colour) so the zero
+    // line stands out against the grid instead of blending into it.
+    QColor zero_colour = _colour;
+    zero_colour.setAlpha(View::ForeAlpha);
+    QPen pen(zero_colour);
     pen.setStyle(Qt::DotLine);
     p.setPen(pen);
     p.drawLine(left, get_zero_vpos(), right, get_zero_vpos());
@@ -1008,28 +1106,114 @@ void DsoSignal::paint_trace(QPainter &p,
 
         QColor trace_colour = _colour;
         trace_colour.setAlpha(View::ForeAlpha);
-        p.setPen(trace_colour);
-
-        QPointF *points = new QPointF[sample_count];
-        QPointF *point = points;
+        p.setPen(QPen(trace_colour, AppConfig::Instance().appOptions.dsoSignalLineWidth));
 
         float top = get_view_rect().top();
         float bottom = get_view_rect().bottom();
         float right =  (float)get_view_rect().right();
         double  pixels_per_sample = 1.0/samples_per_pixel;
 
-        uint8_t value; 
+        uint8_t value;
         float x = (start / samples_per_pixel - pixels_offset) + left + _view->trig_hoff()*pixels_per_sample;
         float y;
- 
+
+        // Several samples per pixel (long time/div): draw each pixel column as
+        // one vertical bar from its lowest to its highest sample, as a scope
+        // does. A polyline through each column's extremes looks the same but
+        // turns a dense signal into a full-height zig-zag, and stroking that
+        // with a pen wider than 1 px or antialiased cost seconds per frame -
+        // a 10 kHz square wave at 20 ms/div took ~11 s at width 1.5. Bars are
+        // pixel-aligned fills with no stroking, so the cost follows the
+        // screen width whatever the signal.
+        if (samples_per_pixel > 2.0) {
+            const double x0 = x;
+            const int64_t columns = (int64_t)ceil(sample_count * pixels_per_sample) + 2;
+            QRect *const rects = new QRect[columns];
+            QRect *rect = rects;
+
+            const float line_width = max(1.0f, (float)AppConfig::Instance().appOptions.dsoSignalLineWidth);
+            auto to_y = [&](uint8_t v) {
+                return min(max(top, zeroY + (v - hw_offset) * _scale), bottom);
+            };
+
+            // Step the column itself rather than deriving it from the sample
+            // index: floor(sample * pixels_per_sample) rounds back down onto
+            // the column just finished whenever (col + 1) * samples_per_pixel
+            // is a whole number - common, since samples_per_pixel is
+            // rate * view time / width - and every such column then took a
+            // second pass, overrunning the buffer.
+            int64_t sample = 0;
+            bool have_prev = false;
+            uint8_t prev_last = 0;
+            for (int64_t col = 0; col < columns && sample < sample_count; col++) {
+                const double col_x = x0 + col;
+                if (col_x > right)
+                    break;
+
+                const int64_t col_end = min((int64_t)ceil((col + 1) * samples_per_pixel), sample_count);
+                if (col_end <= sample)
+                    continue;
+
+                uint8_t vmin = samples_buffer[sample];
+                uint8_t vmax = vmin;
+                for (int64_t i = sample + 1; i < col_end; i++) {
+                    const uint8_t v = samples_buffer[i];
+                    vmin = min(vmin, v);
+                    vmax = max(vmax, v);
+                }
+
+                // Reach back to where the previous column ended, so a step
+                // between two columns is drawn instead of left as a gap.
+                if (have_prev) {
+                    vmin = min(vmin, prev_last);
+                    vmax = max(vmax, prev_last);
+                }
+                prev_last = samples_buffer[col_end - 1];
+                have_prev = true;
+
+                float y0 = to_y(vmin);
+                float y1 = to_y(vmax);
+                if (y0 > y1)
+                    swap(y0, y1);
+                // A flat stretch is still drawn at the configured line width.
+                if (y1 - y0 < line_width) {
+                    const float mid = (y0 + y1) / 2;
+                    y0 = mid - line_width / 2;
+                    y1 = mid + line_width / 2;
+                }
+
+                const int y_px = (int)floor(y0);
+                *rect++ = QRect((int)floor(col_x), y_px, 1, max(1, (int)ceil(y1) - y_px));
+
+                sample = col_end;
+            }
+
+            p.save();
+            p.setRenderHint(QPainter::Antialiasing, false);
+            p.setPen(Qt::NoPen);
+            p.setBrush(trace_colour);
+            p.drawRects(rects, rect - rects);
+            p.restore();
+
+            delete[] rects;
+            return;
+        }
+
+        QPointF *points = new QPointF[sample_count];
+        QPointF *point = points;
+        bool clipped = false;
+
         for (int64_t sample = 0; sample < sample_count; sample++) {
             value = samples_buffer[sample];
             y = min(max(top, zeroY + (value - hw_offset) * _scale), bottom);
             if (x > right) {
+                if (point == points)
+                    break;      // nothing on screen yet to interpolate from
                 point--;
                 const float lastY = point->y() + (y - point->y()) / (x - point->x()) * (right - point->x());
                 point++;
                 *point++ = QPointF(right, lastY);
+                clipped = true;
                 break;
             }
             *point++ = QPointF(x, y);
@@ -1037,6 +1221,22 @@ void DsoSignal::paint_trace(QPainter &p,
         }
 
         p.drawPolyline(points, point - points);
+
+        // Zoomed in far enough that samples are clearly apart: mark each
+        // one. The last point is only an interpolated clip at the right edge
+        // when the loop broke there, so it gets no dot.
+        if (pixels_per_sample >= SampleDotMinSpacing) {
+            const QPointF *dots_end = point;
+            if (clipped)
+                dots_end--;
+            const double dot = std::max(4.0, AppConfig::Instance().appOptions.dsoSignalLineWidth + SampleDotGrow);
+            p.save();
+            p.setPen(Qt::NoPen);
+            p.setBrush(trace_colour);
+            for (const QPointF *d = points; d != dots_end; d++)
+                p.drawEllipse(*d, dot / 2, dot / 2);
+            p.restore();
+        }
 
         delete[] points;
     }
@@ -1051,6 +1251,24 @@ void DsoSignal::compute_soft_measure(int hw_offset)
     if (total < 2)
         return;
 
+    // paint_mid() calls this on every repaint for as long as the hardware
+    // measurement stays invalid, which - while an acquisition is actively
+    // running - can be many times per second. Skip the O(n) rescan below
+    // unless the underlying dataset actually changed. get_trig_time() is
+    // used rather than just the sample count because the configured capture
+    // depth (and so get_sample_count()) is normally the same on every run,
+    // which would otherwise make this cache never invalidate across repeat
+    // captures.
+    const QDateTime trig_time = session->get_trig_time();
+    const uint64_t seq = session->get_dso_data_seq();
+    if (_soft_measure_cache_valid &&
+        _soft_measure_cache_data == _data &&
+        _soft_measure_cache_sample_count == total &&
+        _soft_measure_cache_trig_time == trig_time &&
+        _soft_measure_cache_seq == seq) {
+        return;   // _period/_high_time/etc already hold the current result
+    }
+
     const uint8_t *buf = _data->get_samples(0, 0, get_index());
     if (buf == NULL)
         return;
@@ -1059,16 +1277,18 @@ void DsoSignal::compute_soft_measure(int hw_offset)
     if (samplerate <= 0)
         return;
 
-    uint16_t total_channels = g_slist_length(session->get_device()->get_channels());
-    if (total_channels == 1 && _data->is_file())
-        total_channels++;
-    const uint16_t enabled_channels = _data->get_channel_num();
-    if (enabled_channels == 0)
-        return;
-
-    // Nanoseconds per channel sample (matches the hardware measurement path).
-    const double tfactor = ((double)total_channels / enabled_channels)
-                           * SR_GHZ(1) * 1.0 / samplerate;
+    // Nanoseconds between consecutive samples of THIS channel's buffer.
+    //
+    // Deliberately not the hardware path's tfactor, which additionally scales
+    // by total_channels/enabled_channels: the hardware's cycle counters are
+    // expressed in interleaved acquisition clocks, so they need converting to
+    // per-channel samples. The buffer scanned here is already de-interleaved -
+    // get_samples() returns one channel's own array - and paint_trace() steps
+    // it at exactly 1/samplerate per entry (pixels_per_sample = 1 /
+    // (samplerate * scale)). Applying the channel ratio here as well made the
+    // measured period disagree with the drawn waveform by that ratio - a
+    // 10 kHz signal read as 5 kHz with one of two channels enabled.
+    const double tfactor = SR_GHZ(1) * 1.0 / samplerate;
 
     // Cap the scan so continuous repaints stay cheap; this still covers many
     // cycles for a stable measurement.
@@ -1079,39 +1299,51 @@ void DsoSignal::compute_soft_measure(int hw_offset)
     // "high time" matches the hardware's positive-duty convention.
     auto val = [&](uint64_t i) -> double { return (double)hw_offset - buf[i]; };
 
-    double vmin = 1e300, vmax = -1e300;
+    // Level statistics. These need no edges at all, so they are computed and
+    // published before the cycle measurement below - a DC or non-repetitive
+    // signal still gets Vmax/Vmin/Vp-p/Vrms/Vmean rather than "--".
     int rmin = 255, rmax = 0;
+    double sum = 0, sumsq = 0;
     for (uint64_t i = 0; i < n; i++) {
-        const double v = val(i);
-        vmin = min(vmin, v);
-        vmax = max(vmax, v);
-        rmin = min(rmin, (int)buf[i]);
-        rmax = max(rmax, (int)buf[i]);
-    }
-    if (vmax <= vmin)
-        return;   // flat: nothing to measure
-
-    const double mid = (vmin + vmax) / 2.0;
-    const double hyst = (vmax - vmin) * 0.05;
-    const double hi = mid + hyst;
-    const double lo = mid - hyst;
-
-    // Schmitt-trigger edge detection (rising = low->high voltage).
-    std::vector<uint64_t> rising, falling;
-    bool is_high = (val(0) >= mid);
-    for (uint64_t i = 1; i < n; i++) {
-        const double v = val(i);
-        if (!is_high && v >= hi) {
-            is_high = true;
-            rising.push_back(i);
-        } else if (is_high && v <= lo) {
-            is_high = false;
-            falling.push_back(i);
-        }
+        const int raw = buf[i];
+        rmin = min(rmin, raw);
+        rmax = max(rmax, raw);
+        const double d = (double)hw_offset - raw;
+        sum += d;
+        sumsq += d * d;
     }
 
-    if (rising.size() < 2)
-        return;   // not enough cycles
+    _min  = (uint8_t)rmin;
+    _max  = (uint8_t)rmax;
+    // Same raw-code units as the hardware path, so get_voltage() converts
+    // both identically: RMS about the zero code, mean as a signed offset.
+    _rms  = sqrt(sumsq / n);
+    _mean = sum / n;
+    _mValid = true;
+
+    const data::DsoEdgeSet edge_set = data::dso_detect_edges(n, val);
+    const std::vector<uint64_t> &rising = edge_set.rising;
+    const std::vector<uint64_t> &falling = edge_set.falling;
+
+    if (rising.size() < 2) {
+        // Flat, or not enough cycles. Clear the cycle results rather than
+        // leaving the previous dataset's numbers in place - the cache is
+        // marked valid below either way, so nothing would recompute them.
+        _period      = 0;
+        _high_time   = 0;
+        _rise_time   = 0;
+        _fall_time   = 0;
+        _burst_time  = 0;
+        _pcount      = 0;
+        _level_valid = false;
+
+        _soft_measure_cache_valid = true;
+        _soft_measure_cache_data = _data;
+        _soft_measure_cache_sample_count = total;
+        _soft_measure_cache_trig_time = trig_time;
+        _soft_measure_cache_seq = seq;
+        return;
+    }
 
     // Mean period (samples) from consecutive rising edges.
     double psum = 0;
@@ -1136,12 +1368,23 @@ void DsoSignal::compute_soft_measure(int hw_offset)
     _period      = period_samples * tfactor;
     _high_time   = high_samples * tfactor;
     _pcount      = (uint32_t)rising.size();
-    _min         = (uint8_t)rmin;
-    _max         = (uint8_t)rmax;
     _low         = (uint8_t)rmin;
     _high        = (uint8_t)rmax;
     _level_valid = true;
-    _mValid      = true;
+
+    // The edge detector measures no transition times, so report none rather
+    // than carrying the previous dataset's values into this one.
+    _rise_time   = 0;
+    _fall_time   = 0;
+    _burst_time  = (double)(rising.back() - rising.front()) * tfactor;
+
+    // Only now that a full result exists, record which dataset it belongs to
+    // so subsequent repaints can skip the O(n) rescan until the data changes.
+    _soft_measure_cache_valid = true;
+    _soft_measure_cache_data = _data;
+    _soft_measure_cache_sample_count = total;
+    _soft_measure_cache_trig_time = trig_time;
+    _soft_measure_cache_seq = seq;
 }
 
 void DsoSignal::paint_envelope(QPainter &p,
@@ -1191,7 +1434,11 @@ void DsoSignal::paint_envelope(QPainter &p,
 		*rect++ = QRectF(x, t, 1.0f, h);
 	}
 
-	p.drawRects(rects, e.length);
+    // Antialiasing fractional 1 px rects costs ~2x for no visible gain.
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing, false);
+	p.drawRects(rects, rect - rects);
+    p.restore();
 
 	delete[] rects;
     //delete[] e.samples;
@@ -1475,16 +1722,28 @@ void DsoSignal::auto_set()
             if (_autoV) {
                 const bool over_flag = _max == 0xff || _min == 0x0;
                 const bool out_flag = _max >= 0xE0 || _min <= 0x20;
-                const bool under_flag = _max <= 0xA0 && _min >= 0x60;
+                bool under_flag = _max <= 0xA0 && _min >= 0x60;
+
+                const bool atten = session->get_device()->is_hardware_e8();
+                if (atten) {
+                    // One attenuator step multiplies the swing by 10, not by
+                    // a dial step's ~2, so only step down when the result
+                    // still stays clear of out_flag - otherwise it clips and
+                    // steps straight back up.
+                    const int zero = get_hw_offset();
+                    const int swing = max(_max - zero, zero - _min);
+                    under_flag = swing * 10 < min(0xE0 - zero, zero - 0x20);
+                }
+
                 if (over_flag) {
                     if (!_autoV_over)
                         _auto_cnt = 0;
                     _autoV_over = true;
-                    go_vDialNext(false);
+                    atten ? go_attenStep(1) : go_vDialNext(false);
                 } else if (out_flag) {
-                    go_vDialNext(false);
+                    atten ? go_attenStep(1) : go_vDialNext(false);
                 } else if (!_autoV_over && under_flag) {
-                    go_vDialPre(false);
+                    atten ? go_attenStep(-1) : go_vDialPre(false);
                 } else if (!_autoH) {
                     autoV_end();
                 }
@@ -1675,6 +1934,20 @@ void DsoSignal::call_auto_end(){
 void DsoSignal::set_data(data::DsoSnapshot *data)
 {
     assert(data);
+
+    if (_data != data) {
+        // Measurement state is derived from the samples and is only ever
+        // refreshed from paint_mid(). Swapping the snapshot out from under it
+        // would otherwise leave the status bar showing the old dataset's
+        // numbers until the next repaint - or indefinitely, if the new one
+        // yields no measurement at all.
+        _mValid = false;
+        _level_valid = false;
+        _soft_measure_logged = false;
+        _soft_measure_cache_valid = false;
+        _soft_measure_cache_data = NULL;
+    }
+
     _data = data;
 }
 

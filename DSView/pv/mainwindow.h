@@ -43,6 +43,7 @@ class QStatusBar;
 class QToolBar;
 class QWidget;
 class QDockWidget;
+class QTabBar;
 class AppControl;
 class DeviceAgent;
 
@@ -141,12 +142,16 @@ private:
 	void setup_ui();
     void retranslateUi(); 
     bool eventFilter(QObject *object, QEvent *event);
+    bool event(QEvent *event) override;
+    void update_dock_tab_font();
+    void set_dock_tab_font(QTabBar *bar);
     void check_usb_device_speed();
     void reset_all_view();
     bool confirm_to_store_data();
     void update_toolbar_view_status();
     void calc_min_height();    
     void update_title_bar_text();
+    void apply_toolbar_icon_size();
 
     //json operation
 private:

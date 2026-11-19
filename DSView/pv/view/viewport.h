@@ -32,6 +32,8 @@
 #include <QWidget>
 #include <QNativeGestureEvent>
 #include <QElapsedTimer>
+#include <QVector>
+#include <QPointF>
 #include <chrono>
 
 #include "../view/view.h"
@@ -149,6 +151,7 @@ private:
     void resizeEvent(QResizeEvent *e) override;
     bool gestureEvent(QNativeGestureEvent *event);
 
+    quint64 dso_persist_signature() const;
     void paintSignals(QPainter& p, QColor fore, QColor back);
     void paintProgress(QPainter& p, QColor fore, QColor back);
     void paintMeasure(QPainter &p, QColor fore, QColor back);
@@ -188,7 +191,19 @@ private:
     View_type   _type;
     bool        _need_update;
     QPixmap     _pixmap;
+    QPixmap     _persist_pixmap;    // faded previous DSO frames (persistence)
+    quint64     _persist_sig;       // view/channel state the ghosts belong to
+    double      _persist_scale = 1.0;   // horizontal mapping the ghosts were drawn with
+    qint64      _persist_x_offset = 0;
+    QElapsedTimer _persist_clock;
+    qint64      _persist_pending_ms;
     QMenu       *_cmenu;
+
+    // Reusable scratch buffer for paint_ref_waves(), so it does not have to
+    // heap-allocate/free a QPointF array on every repaint (including ones
+    // triggered by mere mouse movement) - QVector::resize() only reallocates
+    // when growing past the buffer's current capacity.
+    QVector<QPointF> _ref_wave_points;
 
     uint64_t    _sample_received;
     QPoint      _mouse_point;

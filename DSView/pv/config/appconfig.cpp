@@ -135,6 +135,9 @@ static void _loadApp(AppOptions &o, QSettings &st)
     getFiled("logicSignalLineWidth", st, o.logicSignalLineWidth, 1.0f);
     getFiled("logicChannelDivider", st, o.logicChannelDivider, true);
     getFiled("dsoSplitChannels", st, o.dsoSplitChannels, false);
+    getFiled("dsoSignalLineWidth", st, o.dsoSignalLineWidth, 1.0f);
+    getFiled("dsoPersistenceMs", st, o.dsoPersistenceMs, 0);
+    getFiled("toolbarIconSize", st, o.toolbarIconSize, DefaultToolbarIconSize);
 
     o.warnofMultiTrig = true;
 
@@ -158,9 +161,25 @@ static void _loadApp(AppOptions &o, QSettings &st)
         o.traceHeightFactor = 1.0;
     }
 
+    if (o.toolbarIconSize != 0
+        && (o.toolbarIconSize < MinToolbarIconSize || o.toolbarIconSize > MaxToolbarIconSize))
+    {
+        o.toolbarIconSize = DefaultToolbarIconSize;
+    }
+
     if (o.logicSignalLineWidth < 1.0f || o.logicSignalLineWidth > 4.0f)
     {
         o.logicSignalLineWidth = 1.0f;
+    }
+
+    if (o.dsoSignalLineWidth < 1.0f || o.dsoSignalLineWidth > 4.0f)
+    {
+        o.dsoSignalLineWidth = 1.0f;
+    }
+
+    if (o.dsoPersistenceMs < 0 || o.dsoPersistenceMs > 10000)
+    {
+        o.dsoPersistenceMs = 0;
     }
 
     st.endGroup();
@@ -193,6 +212,9 @@ static void _saveApp(AppOptions &o, QSettings &st)
     setFiled("logicSignalLineWidth", st, o.logicSignalLineWidth);
     setFiled("logicChannelDivider", st, o.logicChannelDivider);
     setFiled("dsoSplitChannels", st, o.dsoSplitChannels);
+    setFiled("dsoSignalLineWidth", st, o.dsoSignalLineWidth);
+    setFiled("dsoPersistenceMs", st, o.dsoPersistenceMs);
+    setFiled("toolbarIconSize", st, o.toolbarIconSize);
 
     QString fmt =  FormatArrayToString(o.m_protocolFormats);
     setFiled("protocalFormats", st, fmt);
@@ -294,6 +316,7 @@ static void _loadHistory(UserHistory &o, QSettings &st)
     getFiled("openDir", st, o.openDir, "");
     getFiled("protocolExportPath", st, o.protocolExportPath, "");
     getFiled("exportFormat", st, o.exportFormat, "");
+    getFiled("showDriverHint", st, o.showDriverHint, true);
     st.endGroup();
 }
 
@@ -308,6 +331,7 @@ static void _saveHistory(UserHistory &o, QSettings &st)
     setFiled("openDir", st, o.openDir);
     setFiled("protocolExportPath", st, o.protocolExportPath);
     setFiled("exportFormat", st, o.exportFormat);
+    setFiled("showDriverHint", st, o.showDriverHint);
     st.endGroup();
 }
 

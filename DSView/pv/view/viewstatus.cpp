@@ -25,7 +25,6 @@
 #include <QPainter>
 #include <QStyleOption>
 #include <QMouseEvent>
-#include <QBitmap>
 #include <QJsonObject>
 #include <QJsonArray>
 
@@ -119,12 +118,10 @@ void ViewStatus::paintEvent(QPaintEvent *)
             p.setBrush(active ? dsoSig->get_colour() : fore);
             p.drawRect(QRect(rect.topLeft(), QSize(10, rect.height())));
 
-            QPixmap msPix(pv::dialogs::DsoMeasure::get_ms_icon(std::get<2>(_mrects[i])));
-            QBitmap msMask = msPix.createMaskFromColor(QColor("black"), Qt::MaskOutColor);
-            msPix.fill(active ? dsoSig->get_colour() : fore);
-            msPix.setMask(msMask);
-            p.drawPixmap(QRect(rect.left()+10, rect.top(), rect.height(), rect.height()),
-                         msPix);
+            p.drawPixmap(rect.left()+10, rect.top(),
+                         pv::dialogs::DsoMeasure::get_ms_pixmap(std::get<2>(_mrects[i]),
+                                                                active ? dsoSig->get_colour() : fore,
+                                                                rect.height(), devicePixelRatioF()));
 
             p.setPen(((int)i == _hit_rect) ? View::Blue :
                      active ? dsoSig->get_colour() : fore);
@@ -188,6 +185,9 @@ void ViewStatus::reload()
 
 void ViewStatus::repeat_unshow()
 {
+    if (_capture_status.isEmpty())
+        return;
+
     _capture_status.clear();
     update();
 }
@@ -205,13 +205,22 @@ void ViewStatus::set_rle_depth(uint64_t depth)
 
 void ViewStatus::set_capture_status(bool triggered, int progess)
 {
+    QString capture_status;
     if (triggered) {
-        _capture_status = L_S(STR_PAGE_DLG, S_ID(IDS_DLG_TRIGGERED), "Triggered! ") + QString::number(progess) 
+        capture_status = L_S(STR_PAGE_DLG, S_ID(IDS_DLG_TRIGGERED), "Triggered! ") + QString::number(progess)
                         + L_S(STR_PAGE_DLG, S_ID(IDS_DLG_CAPTURED), "% Captured");
     } else {
-        _capture_status = L_S(STR_PAGE_DLG, S_ID(IDS_DLG_WAITING_FOR_TRIGGER), "Waiting for Trigger! ") + QString::number(progess) 
+        capture_status = L_S(STR_PAGE_DLG, S_ID(IDS_DLG_WAITING_FOR_TRIGGER), "Waiting for Trigger! ") + QString::number(progess)
                         + L_S(STR_PAGE_DLG, S_ID(IDS_DLG_CAPTURED), "% Captured");
     }
+
+    // Capture progress is also reported during viewport painting; avoid
+    // repainting when the displayed text has not changed
+    if (_capture_status == capture_status)
+        return;
+
+    _capture_status = capture_status;
+    update();
 }
 
 void ViewStatus::mousePressEvent(QMouseEvent *event)
